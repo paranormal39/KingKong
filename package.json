@@ -1,0 +1,30 @@
+{
+  "name": "kingkong-game-server",
+  "version": "1.0.0",
+  "description": "Basic game server template - WebSocket game backend with sessions, teams, chat, matchmaking, quests, and persistence",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "set LOG_LEVEL=DEBUG&& node server.js",
+    "prod": "set LOG_LEVEL=INFO&& node server.js",
+    "lint": "eslint *.js config/*.js utils/*.js modules/**/*.js",
+    "lint:fix": "eslint *.js config/*.js utils/*.js modules/**/*.js --fix",
+    "format": "prettier --write *.js config/*.js utils/*.js modules/**/*.js"
+  },
+  "license": "ISC",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "node-cron": "^3.0.3",
+    "sqlite3": "^5.1.7",
+    "uuid": "^9.0.1",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.0",
+    "prettier": "^3.2.5"
+  }
+}
