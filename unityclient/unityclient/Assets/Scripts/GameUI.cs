@@ -21,6 +21,11 @@ public class GameUI : MonoBehaviour
     TMP_Text chatText;
     TMP_InputField chatInput;
     ScrollRect chatScroll;
+    GameObject hpBar;
+    Image hpFill;
+    TMP_Text crosshair;
+    GameObject deathOverlay;
+    TMP_Text deathText;
 
     readonly StringBuilder chatLog = new StringBuilder();
     int lineCount = 0;
@@ -92,6 +97,10 @@ public class GameUI : MonoBehaviour
         };
         net.OnRawMessage += json =>
             AppendSystem($"[{string.Join(", ", json.Properties().Select(p => p.Name))}]");
+        net.OnPlayerKilled += (killer, victim) =>
+            AppendSystem($"{killer} eliminated {victim}");
+        net.OnDied += _ => SetStatus("You were eliminated", Color.red);
+        net.OnRespawned += _ => SetStatus($"Online - {net.displayName} ({net.playerId}) [{net.team}]", Color.green);
 
         nameInput.text = PlayerPrefs.GetString("kk_displayName", "");
     }
@@ -113,6 +122,23 @@ public class GameUI : MonoBehaviour
         {
             chatInput.Select();
             chatInput.ActivateInputField();
+        }
+
+        // HUD: health bar, crosshair, death overlay
+        var net = GameNetwork.Instance;
+        if (net != null && net.IsLoggedIn)
+        {
+            hpFill.fillAmount = net.hp / 100f;
+            hpFill.color = Color.Lerp(Color.red, Color.green, net.hp / 100f);
+            hpBar.SetActive(true);
+            crosshair.gameObject.SetActive(net.alive && Cursor.lockState == CursorLockMode.Locked);
+            deathOverlay.SetActive(!net.alive);
+        }
+        else
+        {
+            hpBar.SetActive(false);
+            crosshair.gameObject.SetActive(false);
+            deathOverlay.SetActive(false);
         }
     }
 
@@ -303,6 +329,56 @@ public class GameUI : MonoBehaviour
         sbRt.offsetMin = new Vector2(-188, 12);
         sbRt.offsetMax = new Vector2(-12, 76);
         sendBtn.onClick.AddListener(OnSendClicked);
+
+        // --- Crosshair (screen center) ---
+        crosshair = MakeText(canvasGo.transform, "Crosshair", "+",
+            36, TextAlignmentOptions.Center, Color.white);
+        var crossRt = crosshair.rectTransform;
+        crossRt.anchorMin = new Vector2(0.5f, 0.5f);
+        crossRt.anchorMax = new Vector2(0.5f, 0.5f);
+        crossRt.sizeDelta = new Vector2(50, 50);
+        crossRt.anchoredPosition = Vector2.zero;
+        crosshair.gameObject.SetActive(false);
+
+        // --- Health bar (bottom center, above chat) ---
+        hpBar = MakePanel(canvasGo.transform, "HPBar",
+            new Vector2(0.5f, 0), new Vector2(0.5f, 0), new Vector2(0.5f, 0),
+            new Vector2(440, 40), new Color(0.08f, 0.08f, 0.08f, 0.9f));
+        hpBar.GetComponent<RectTransform>().anchoredPosition = new Vector2(0, 585);
+
+        var fillGo = new GameObject("Fill", typeof(RectTransform), typeof(Image));
+        fillGo.transform.SetParent(hpBar.transform, false);
+        var fillRt = fillGo.GetComponent<RectTransform>();
+        fillRt.anchorMin = Vector2.zero;
+        fillRt.anchorMax = Vector2.one;
+        fillRt.offsetMin = new Vector2(4, 4);
+        fillRt.offsetMax = new Vector2(-4, -4);
+        hpFill = fillGo.GetComponent<Image>();
+        hpFill.color = Color.green;
+        hpFill.type = Image.Type.Filled;
+        hpFill.fillMethod = Image.FillMethod.Horizontal;
+        hpFill.fillOrigin = (int)Image.OriginHorizontal.Left;
+        hpBar.SetActive(false);
+
+        // --- Death overlay ---
+        deathOverlay = new GameObject("DeathOverlay", typeof(RectTransform), typeof(Image));
+        deathOverlay.transform.SetParent(canvasGo.transform, false);
+        var doRt = deathOverlay.GetComponent<RectTransform>();
+        doRt.anchorMin = Vector2.zero;
+        doRt.anchorMax = Vector2.one;
+        doRt.offsetMin = Vector2.zero;
+        doRt.offsetMax = Vector2.zero;
+        deathOverlay.GetComponent<Image>().color = new Color(0.5f, 0, 0, 0.45f);
+
+        deathText = MakeText(deathOverlay.transform, "DeathText",
+            "YOU DIED\n<size=40>respawning...</size>",
+            72, TextAlignmentOptions.Center, Color.white);
+        var dtRt = deathText.rectTransform;
+        dtRt.anchorMin = Vector2.zero;
+        dtRt.anchorMax = Vector2.one;
+        dtRt.offsetMin = Vector2.zero;
+        dtRt.offsetMax = Vector2.zero;
+        deathOverlay.SetActive(false);
 
         chatPanel.SetActive(false);
     }

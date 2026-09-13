@@ -12,6 +12,7 @@ const PvPHandler = require('./pvp-handler');
 const QuestHandler = require('./quest-handler');
 const TeamHandler = require('./team-handler');
 const PresenceHandler = require('./presence-handler');
+const CombatHandler = require('./combat-handler');
 
 class HandlerRegistry {
   constructor() {
@@ -33,7 +34,8 @@ class HandlerRegistry {
       new PvPHandler(),
       new QuestHandler(),
       new TeamHandler(),
-      new PresenceHandler()
+      new PresenceHandler(),
+      new CombatHandler()
     ];
 
     // Give each handler access to services (needed by onDisconnect hooks

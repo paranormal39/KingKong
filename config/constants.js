@@ -16,6 +16,16 @@ module.exports = {
     SPAWN_RADIUS: 8      // players spawn inside this radius at origin
   },
 
+  // Combat
+  COMBAT: {
+    MAX_HP: 100,
+    SHOT_DAMAGE: 20,
+    SHOT_RANGE: 60,         // max hit distance in world units
+    FIRE_INTERVAL_MS: 300,  // server-enforced minimum time between shots
+    RESPAWN_MS: 5000,       // dead players respawn after 5s
+    KILL_LOYALTY: 5         // loyalty points per elimination
+  },
+
   // Payload Obfuscation Configuration (XOR fallback - obfuscation only, not security)
   PAYLOAD_SECRET: process.env.PAYLOAD_SECRET || 'change-me',
 

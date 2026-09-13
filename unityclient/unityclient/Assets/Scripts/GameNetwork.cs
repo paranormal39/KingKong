@@ -34,6 +34,8 @@ public class GameNetwork : MonoBehaviour
     public int loyaltyPoints;
     [Tooltip("Server-assigned spawn point from LOGIN_COMPLETE/SESSION_RESTORED")]
     public Vector3 spawnPosition;
+    public int hp = 100;
+    public bool alive = true;
 
     public bool IsConnected => websocket != null && websocket.State == WebSocketState.Open;
     public bool IsLoggedIn { get; private set; }
@@ -51,8 +53,16 @@ public class GameNetwork : MonoBehaviour
     public event Action OnLoggedIn;
     /// <summary>from, displayName, team, text</summary>
     public event Action<string, string, string, string> OnChatMessage;
-    /// <summary>World-state snapshot: JArray of { playerId, displayName, team, x, y, z, yaw }</summary>
+    /// <summary>World-state snapshot: JArray of { playerId, displayName, team, x, y, z, yaw, hp, alive }</summary>
     public event Action<JArray> OnWorldState;
+    /// <summary>Own hp changed (value = new hp)</summary>
+    public event Action<int> OnHealthChanged;
+    /// <summary>We were eliminated (killerName)</summary>
+    public event Action<string> OnDied;
+    /// <summary>We respawned (server spawn position)</summary>
+    public event Action<Vector3> OnRespawned;
+    /// <summary>Kill feed: killerName, victimName</summary>
+    public event Action<string, string> OnPlayerKilled;
     /// <summary>Raw parsed payload for any message not otherwise handled</summary>
     public event Action<JObject> OnRawMessage;
     /// <summary>Human-readable error/info line for UI display</summary>
@@ -162,6 +172,15 @@ public class GameNetwork : MonoBehaviour
 
         SendJson(JsonUtility.ToJson(new LoginMessage {
             LOGIN = true, playerId = explicitPlayerId, displayName = displayName
+        }));
+    }
+
+    /// <summary>Report a shot hit on a remote player.</summary>
+    public void SendShoot(string targetId)
+    {
+        if (!IsConnected || !IsLoggedIn || !alive) return;
+        SendJson(JsonUtility.ToJson(new ShootMessage {
+            SHOOT = new ShootData { targetId = targetId }
         }));
     }
 
@@ -301,14 +320,65 @@ public class GameNetwork : MonoBehaviour
             return;
         }
 
+        if (json.ContainsKey("PLAYER_KILLED"))
+        {
+            var k = json["PLAYER_KILLED"];
+            var killerName = k?["killerName"]?.ToString() ?? "?";
+            var victimName = k?["victimName"]?.ToString() ?? "?";
+            OnPlayerKilled?.Invoke(killerName, victimName);
+            return;
+        }
+
         if (json.ContainsKey("WORLD_STATE"))
         {
-            OnWorldState?.Invoke(json["WORLD_STATE"]?["players"] as JArray);
+            var players = json["WORLD_STATE"]?["players"] as JArray;
+            TrackSelfState(players);
+            OnWorldState?.Invoke(players);
             return;
         }
 
         // Anything else (DAILY_QUEST, MATCH_FOUND, LEADERBOARD, ...) goes to raw listeners
         OnRawMessage?.Invoke(json);
+    }
+
+    /// <summary>
+    /// Track our own hp/alive from the authoritative snapshot and fire
+    /// death/respawn events on transitions.
+    /// </summary>
+    void TrackSelfState(JArray players)
+    {
+        if (players == null || string.IsNullOrEmpty(playerId)) return;
+
+        foreach (var p in players)
+        {
+            if (p["playerId"]?.ToString() != playerId) continue;
+
+            int newHp = p["hp"]?.ToObject<int>() ?? hp;
+            bool newAlive = p["alive"]?.ToObject<bool>() ?? true;
+
+            if (newHp != hp)
+            {
+                hp = newHp;
+                OnHealthChanged?.Invoke(hp);
+            }
+
+            if (alive && !newAlive)
+            {
+                alive = false;
+                OnDied?.Invoke(""); // killer name comes via PLAYER_KILLED
+            }
+            else if (!alive && newAlive)
+            {
+                alive = true;
+                hp = newHp;
+                var pos = new Vector3(
+                    p["x"]?.ToObject<float>() ?? 0,
+                    p["y"]?.ToObject<float>() ?? 0.1f,
+                    p["z"]?.ToObject<float>() ?? 0);
+                OnRespawned?.Invoke(pos);
+            }
+            return;
+        }
     }
 
     static Vector3 ParseSpawn(JToken spawn)
@@ -359,5 +429,17 @@ public class GameNetwork : MonoBehaviour
         public float y;
         public float z;
         public float yaw;
+    }
+
+    [Serializable]
+    class ShootMessage
+    {
+        public ShootData SHOOT;
+    }
+
+    [Serializable]
+    class ShootData
+    {
+        public string targetId;
     }
 }

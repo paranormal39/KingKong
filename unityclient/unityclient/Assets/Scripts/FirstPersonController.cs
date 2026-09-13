@@ -21,9 +21,14 @@ public class FirstPersonController : MonoBehaviour
     public float gravity = -19.6f;
     public Transform cameraTransform;
 
+    public float fireInterval = 0.3f; // matches server FIRE_INTERVAL_MS
+    public float shootRange = 60f;    // matches server SHOT_RANGE
+
     CharacterController cc;
     float pitch;
     float velocityY;
+    bool isDead;
+    float lastShotAt;
 
     // Position reporting to the server (10 Hz while moving, 0.5 Hz keepalive)
     float sendTimer;
@@ -57,7 +62,30 @@ public class FirstPersonController : MonoBehaviour
         foreach (var al in FindObjectsByType<AudioListener>(FindObjectsSortMode.None))
             if (al.transform != cameraTransform) al.enabled = false;
 
+        // Death / respawn wiring (server-authoritative)
+        var net = GameNetwork.Instance;
+        if (net != null)
+        {
+            net.OnDied += HandleDied;
+            net.OnRespawned += RespawnAt;
+        }
+
         LockCursor(true);
+    }
+
+    void OnDestroy()
+    {
+        var net = GameNetwork.Instance;
+        if (net != null)
+        {
+            net.OnDied -= HandleDied;
+            net.OnRespawned -= RespawnAt;
+        }
+    }
+
+    void HandleDied(string killerName)
+    {
+        isDead = true;
     }
 
     void Update()
@@ -76,7 +104,7 @@ public class FirstPersonController : MonoBehaviour
                  && !UnityEngine.EventSystems.EventSystem.current.IsPointerOverGameObject())
             LockCursor(true);
 
-        bool playing = Cursor.lockState == CursorLockMode.Locked && !GameUI.ChatFocused;
+        bool playing = Cursor.lockState == CursorLockMode.Locked && !GameUI.ChatFocused && !isDead;
 
         // Look
         if (playing)
@@ -86,6 +114,20 @@ public class FirstPersonController : MonoBehaviour
             pitch = Mathf.Clamp(pitch - delta.y, -85f, 85f);
             cameraTransform.localEulerAngles = new Vector3(pitch, 0, 0);
         }
+
+        // Shoot
+        if (playing && mouse.leftButton.wasPressedThisFrame
+            && Time.time - lastShotAt >= fireInterval)
+        {
+            lastShotAt = Time.time;
+            Shoot();
+        }
+
+        // Camera sinks while dead
+        var targetCamY = isDead ? 0.4f : 1.65f;
+        var camPos = cameraTransform.localPosition;
+        camPos.y = Mathf.Lerp(camPos.y, targetCamY, 6f * Time.deltaTime);
+        cameraTransform.localPosition = camPos;
 
         // Move
         var mv = Vector2.zero;
@@ -126,6 +168,55 @@ public class FirstPersonController : MonoBehaviour
                 GameNetwork.Instance?.SendMove(transform.position, transform.eulerAngles.y);
             }
         }
+    }
+
+    /// <summary>
+    /// Raycast from the crosshair; if it hits a remote player, report the
+    /// shot to the server (which validates range/rate and applies damage).
+    /// </summary>
+    void Shoot()
+    {
+        var cam = cameraTransform;
+        var origin = cam.position;
+        var dir = cam.forward;
+
+        Vector3 hitPoint = origin + dir * shootRange;
+        if (Physics.Raycast(origin, dir, out var hit, shootRange))
+        {
+            hitPoint = hit.point;
+            var tag = hit.collider.GetComponentInParent<RemotePlayerTag>();
+            if (tag != null)
+                GameNetwork.Instance?.SendShoot(tag.playerId);
+        }
+
+        FireTracer(origin + dir * 0.5f + cam.right * 0.1f - Vector3.up * 0.15f, hitPoint);
+    }
+
+    void FireTracer(Vector3 from, Vector3 to)
+    {
+        var go = new GameObject("Tracer");
+        var lr = go.AddComponent<LineRenderer>();
+        lr.positionCount = 2;
+        lr.SetPosition(0, from);
+        lr.SetPosition(1, to);
+        lr.startWidth = 0.03f;
+        lr.endWidth = 0.03f;
+        var shader = Shader.Find("Universal Render Pipeline/Unlit");
+        if (shader == null) shader = Shader.Find("Unlit/Color");
+        lr.material = new Material(shader);
+        lr.startColor = lr.endColor = new Color(1f, 0.9f, 0.2f);
+        Destroy(go, 0.08f);
+    }
+
+    /// <summary>Teleport to the server-assigned respawn point.</summary>
+    void RespawnAt(Vector3 pos)
+    {
+        cc.enabled = false;
+        transform.position = pos;
+        pitch = 0;
+        velocityY = 0;
+        cc.enabled = true;
+        isDead = false;
     }
 
     static void LockCursor(bool locked)

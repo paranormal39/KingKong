@@ -9,7 +9,8 @@ const CONFIG = require('../../config/constants');
 
 class WorldStateManager {
   constructor() {
-    // playerId -> { clientId, displayName, team, x, y, z, yaw, lastMoveAt }
+    // playerId -> { clientId, displayName, team, x, y, z, yaw,
+    //               hp, alive, respawnAt, lastShotAt, lastMoveAt }
     this.players = new Map();
   }
 
@@ -45,6 +46,10 @@ class WorldStateManager {
       y: spawn.y,
       z: spawn.z,
       yaw: 0,
+      hp: CONFIG.COMBAT.MAX_HP,
+      alive: true,
+      respawnAt: 0,
+      lastShotAt: 0,
       lastMoveAt: 0
     };
     this.players.set(playerId, entry);
@@ -76,7 +81,7 @@ class WorldStateManager {
    */
   updatePosition(playerId, data) {
     const entry = this.players.get(playerId);
-    if (!entry) return false;
+    if (!entry || !entry.alive) return false;
 
     let { x, y, z, yaw } = data || {};
     x = Number(x); y = Number(y); z = Number(z); yaw = Number(yaw) || 0;
@@ -107,6 +112,70 @@ class WorldStateManager {
   }
 
   /**
+   * Apply a shot from shooter to target.
+   * Validates: both exist + alive, range, fire rate.
+   * @returns {Object|null} result with hit/killed flags, or null if rejected
+   */
+  applyShot(shooterId, targetId) {
+    const shooter = this.players.get(shooterId);
+    const target = this.players.get(targetId);
+    if (!shooter || !target || !shooter.alive || !target.alive) return null;
+    if (shooterId === targetId) return null;
+
+    // Fire rate check
+    const now = Date.now();
+    if (now - shooter.lastShotAt < CONFIG.COMBAT.FIRE_INTERVAL_MS) return null;
+    shooter.lastShotAt = now;
+
+    // Range check (3D distance between authoritative positions)
+    const dx = target.x - shooter.x;
+    const dy = target.y - shooter.y;
+    const dz = target.z - shooter.z;
+    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (dist > CONFIG.COMBAT.SHOT_RANGE) {
+      logger.debug('WORLD', `Shot out of range: ${shooterId} -> ${targetId} (${dist.toFixed(1)}u)`);
+      return null;
+    }
+
+    target.hp = Math.max(0, target.hp - CONFIG.COMBAT.SHOT_DAMAGE);
+    const killed = target.hp <= 0;
+    if (killed) {
+      target.alive = false;
+      target.respawnAt = now + CONFIG.COMBAT.RESPAWN_MS;
+      logger.info('WORLD', `${shooterId} eliminated ${targetId}`);
+    }
+
+    return {
+      hit: true,
+      killed,
+      targetHp: target.hp,
+      distance: dist
+    };
+  }
+
+  /**
+   * Respawn dead players whose timer elapsed. Returns list of respawned entries.
+   * Called from the broadcast tick.
+   */
+  checkRespawns() {
+    const now = Date.now();
+    const respawned = [];
+    for (const [playerId, e] of this.players.entries()) {
+      if (!e.alive && e.respawnAt > 0 && now >= e.respawnAt) {
+        const spawn = this.assignSpawn();
+        e.x = spawn.x; e.y = spawn.y; e.z = spawn.z;
+        e.hp = CONFIG.COMBAT.MAX_HP;
+        e.alive = true;
+        e.respawnAt = 0;
+        e.lastMoveAt = 0;
+        logger.info('WORLD', `${playerId} respawned at (${spawn.x.toFixed(1)}, ${spawn.z.toFixed(1)})`);
+        respawned.push({ playerId, displayName: e.displayName, spawn });
+      }
+    }
+    return respawned;
+  }
+
+  /**
    * Canonical snapshot for broadcast.
    */
   getSnapshot() {
@@ -116,7 +185,9 @@ class WorldStateManager {
         playerId,
         displayName: e.displayName,
         team: e.team,
-        x: e.x, y: e.y, z: e.z, yaw: e.yaw
+        x: e.x, y: e.y, z: e.z, yaw: e.yaw,
+        hp: e.hp,
+        alive: e.alive
       });
     }
     return players;
@@ -126,6 +197,7 @@ class WorldStateManager {
    * Broadcast WORLD_STATE to all logged-in clients.
    */
   broadcast(clientManager) {
+    this.checkRespawns();
     if (this.players.size === 0) return;
     clientManager.broadcast(
       {

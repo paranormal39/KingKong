@@ -23,6 +23,7 @@ nothing needs to be placed in a scene. The controllable player object
 |---|---|
 | WASD | Move |
 | Mouse | Look (cursor captured on click) |
+| Left click | Shoot (raycast -> server-validated damage) |
 | Space | Jump |
 | Esc | Release cursor (to click UI) |
 | C or CHAT button | Hide / show chat panel |
