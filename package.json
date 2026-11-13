@@ -7,6 +7,7 @@
     "start": "node server.js",
     "dev": "set LOG_LEVEL=DEBUG&& node server.js",
     "prod": "set LOG_LEVEL=INFO&& node server.js",
+    "test": "node --test ./test/heroes.test.js",
     "lint": "eslint *.js config/*.js utils/*.js modules/**/*.js",
     "lint:fix": "eslint *.js config/*.js utils/*.js modules/**/*.js --fix",
     "format": "prettier --write *.js config/*.js utils/*.js modules/**/*.js"

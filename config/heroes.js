@@ -264,7 +264,7 @@ module.exports = {
   MELEE,
   HERO_IDS: Object.keys(HEROES),
   getHero(id) {
-    return HEROES[id] || null;
+    return Object.prototype.hasOwnProperty.call(HEROES, id) ? HEROES[id] : null;
   },
   isValidHero(id) {
     return Object.prototype.hasOwnProperty.call(HEROES, id);

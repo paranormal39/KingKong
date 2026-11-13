@@ -1,6 +1,8 @@
 # KingKong
 
-A hero-based multiplayer **arena shooter** — no blockchain, no crypto:
+**Project type:** a Phase 1 multiplayer arena-shooter vertical slice: a Node.js
+WebSocket/HTTP game server paired with a Unity 6 client. This is a playable game
+project, not a generic server template.
 
 - **`server.js`** — Node.js WebSocket game server: player sessions, menu +
   matchmaking, instanced arena matches with bot fill, 8 witch heroes with full
@@ -11,9 +13,14 @@ A hero-based multiplayer **arena shooter** — no blockchain, no crypto:
   control kit, generated world, and hero-tinted remote avatars synced from the
   arena's server world-state broadcasts.
 
-Identity is a simple `playerId` (server-generated if omitted) + session token —
-no wallets, no signing. The persistent `red/blue/green` teams exist only for the
-season leaderboard; inside a match you play your chosen hero.
+Prototype identity uses a `playerId` (server-generated if omitted) and a session
+token — no wallets or signing. Client-supplied IDs are not proof of account
+ownership; this login flow is not suitable for production authentication yet.
+The persistent `red/blue/green` teams exist only for the season leaderboard;
+inside a match you play your chosen hero.
+
+See [HANDOVER.md](HANDOVER.md) for the architecture/security review, prioritized
+findings, and the two-phase remediation plan.
 
 ## Game flow
 
@@ -80,8 +87,9 @@ Endpoints: `GET /health` (status + DB + live arena stats), `GET /api/errors`,
 Verify it works:
 
 ```powershell
-node test-client.js    # 28 e2e checks: login, catalog, FFA match, combat, abilities, restore
-npx eslint .           # lint
+npm test               # focused unit tests
+npm run lint           # server lint
+node test-client.js     # manual smoke test; start the server in another terminal first
 ```
 
 ## Protocol (flat JSON; key = message type)
@@ -133,7 +141,9 @@ active quest and loyalty.
 `railway.json` is included — point Railway/Render/etc. at the repo root, set
 `PORT`, and it health-checks `/health`. Season/leaderboard persistence lives
 under `data/` (`game.db` + JSON snapshots, autosaved every 5 min, daily backups
-via cron).
+via cron). The repository does not configure a persistent deployment volume:
+mount durable storage at `data/` or use a managed database before production
+deployment, or player data may be lost when the service is replaced.
 
 ## Unity client setup
 
