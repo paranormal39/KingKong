@@ -1,11 +1,17 @@
 /**
- * Combat Handler
- * Shooting / damage / kills:
- * - SHOOT: { SHOOT: { targetId } } - client raycast hit report,
- *   server validates range + fire rate, applies damage, records kills.
+ * Combat Handler (arena-scoped)
+ * Routes in-match combat actions to the player's arena. The arena + ability
+ * system are server-authoritative: they validate ammo, fire rate, range,
+ * cooldowns and apply damage / effects.
+ *
+ * - PRIMARY_FIRE   { targetId }   Left Mouse
+ * - SECONDARY_FIRE { targetId }   Right Mouse (alt fire)
+ * - RELOAD                        R
+ * - MELEE          { targetId }   V
+ * - WEAPON_SWITCH  { slot }       1 / 2
+ * - ABILITY        { slot }       F (tactical) / E (special) / Shift (movement) / Q (ultimate)
  */
 const BaseHandler = require('./base-handler');
-const logger = require('../../utils/logger');
 const CONFIG = require('../../config/constants');
 
 class CombatHandler extends BaseHandler {
@@ -15,47 +21,55 @@ class CombatHandler extends BaseHandler {
   }
 
   registerHandlers() {
-    this.register('SHOOT', this.handleShoot.bind(this));
+    this.register('PRIMARY_FIRE', this.handlePrimaryFire.bind(this));
+    this.register('SECONDARY_FIRE', this.handleSecondaryFire.bind(this));
+    this.register('RELOAD', this.handleReload.bind(this));
+    this.register('MELEE', this.handleMelee.bind(this));
+    this.register('WEAPON_SWITCH', this.handleWeaponSwitch.bind(this));
+    this.register('ABILITY', this.handleAbility.bind(this));
   }
 
-  async handleShoot(context) {
-    const playerId = this.requirePlayer(context, 'Must be logged in to shoot');
-    const { worldState, teamManager, clientManager } = context.services;
+  payload(context, key) {
+    const v = context.message[key];
+    return (v && typeof v === 'object') ? v : context.message;
+  }
 
-    const shootData = (context.message.SHOOT && typeof context.message.SHOOT === 'object')
-      ? context.message.SHOOT
-      : context.message;
-    const targetId = shootData.targetId;
-    if (!targetId || typeof targetId !== 'string') return;
+  handlePrimaryFire(context) {
+    const playerId = this.requirePlayer(context, 'Must be in a match to fire');
+    const data = this.payload(context, 'PRIMARY_FIRE');
+    context.services.arenaManager.routeFire(playerId, data.targetId || null);
+  }
 
-    const result = worldState.applyShot(playerId, targetId);
-    if (!result || !result.hit) return;
+  handleSecondaryFire(context) {
+    const playerId = this.requirePlayer(context, 'Must be in a match to fire');
+    const data = this.payload(context, 'SECONDARY_FIRE');
+    context.services.arenaManager.routeFire(playerId, data.targetId || null);
+  }
 
-    if (result.killed) {
-      const shooter = worldState.players.get(playerId);
-      const victim = worldState.players.get(targetId);
+  handleReload(context) {
+    const playerId = this.requirePlayer(context);
+    context.services.arenaManager.routeReload(playerId);
+  }
 
-      // Record the kill in persistent stats
-      try {
-        teamManager.recordKills(playerId, 1);
-        teamManager.addLoyaltyPoints(playerId, CONFIG.COMBAT.KILL_LOYALTY, 'pvp_kill');
-      } catch (err) {
-        logger.warn('COMBAT', `Failed to record kill: ${err.message}`);
-      }
+  handleMelee(context) {
+    const playerId = this.requirePlayer(context);
+    const data = this.payload(context, 'MELEE');
+    context.services.arenaManager.routeMelee(playerId, data.targetId || null);
+  }
 
-      clientManager.broadcast(
-        {
-          PLAYER_KILLED: {
-            victimId: targetId,
-            victimName: victim?.displayName || targetId,
-            killerId: playerId,
-            killerName: shooter?.displayName || playerId,
-            respawnIn: CONFIG.COMBAT.RESPAWN_MS
-          }
-        },
-        (cid, cdata) => !!cdata.playerId
-      );
-    }
+  handleWeaponSwitch(context) {
+    const playerId = this.requirePlayer(context);
+    const data = this.payload(context, 'WEAPON_SWITCH');
+    const slot = Number(data.slot) === 1 ? 1 : 0;
+    context.services.arenaManager.routeSwitch(playerId, slot);
+  }
+
+  handleAbility(context) {
+    const playerId = this.requirePlayer(context);
+    const data = this.payload(context, 'ABILITY');
+    const slot = data.slot;
+    if (!CONFIG.ABILITY.SLOTS.includes(slot)) return;
+    context.services.arenaManager.routeAbility(playerId, slot);
   }
 }
 

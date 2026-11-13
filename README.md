@@ -1,33 +1,65 @@
 # KingKong
 
-A plain multiplayer game stack — **no blockchain, no crypto**:
+A hero-based multiplayer **arena shooter** — no blockchain, no crypto:
 
-- **`server.js`** — Node.js WebSocket game server: player sessions, generic teams,
-  global chat, PvP tap-duels, daily quests, leaderboards, server-authoritative
-  world positions + combat (shooting, HP, respawns), and SQLite + JSON snapshot
-  persistence.
-- **`unityclient/unityclient/`** — Unity 6 client: auto-generated UI
-  (login + chat + HUD), first-person controller with shooting, generated world,
-  and remote-player avatars with health bars synced from server world-state
-  broadcasts.
+- **`server.js`** — Node.js WebSocket game server: player sessions, menu +
+  matchmaking, instanced arena matches with bot fill, 8 witch heroes with full
+  ability kits, server-authoritative world positions + combat + abilities, and
+  SQLite + JSON snapshot persistence for the season/leaderboard meta.
+- **`unityclient/unityclient/`** — Unity 6 client: auto-generated menu → mode
+  select → matchmaking → hero selector → in-arena HUD, a full first-person
+  control kit, generated world, and hero-tinted remote avatars synced from the
+  arena's server world-state broadcasts.
 
 Identity is a simple `playerId` (server-generated if omitted) + session token —
-no wallets, no signing.
+no wallets, no signing. The persistent `red/blue/green` teams exist only for the
+season leaderboard; inside a match you play your chosen hero.
 
-## Repo layout
+## Game flow
 
 ```
-server.js                    Entry point: Express /health + WebSocket + cron + heartbeat
-config/constants.js          Teams, scoring, rate limits, world bounds
-utils/                       Logger, standardized errors
-modules/websocket/           Router (plain JSON + XOR fallback), client manager
-modules/handlers/            session, chat, pvp, quest, team, presence (MOVE), combat (SHOOT)
-modules/teams/               Team manager (assign, loyalty, ranks, seasons)
-modules/world/               WorldStateManager - authoritative positions, HP, respawns
-modules/persistence/         JSON snapshots + SQLite (data/game.db)
-unityclient/unityclient/     Unity 6 project (self-bootstrapping)
-test-client.js               Node e2e smoke test (27 checks)
+Login -> Main Menu (mode select) -> Matchmaking (bot-filled) ->
+Hero Select (lock a witch) -> Arena match -> Results -> back to Menu
 ```
+
+## Modes (`config/modes.js`)
+
+| Mode | Status | Shape | Win condition |
+|---|---|---|---|
+| Free-for-All | **enabled** | up to 8 players | first to 20 kills, or most kills at 5:00 |
+| 2v2 / 3v3 / 5v5 | defined, gated (Phase 2) | team deathmatch | kill limit or time |
+
+A single human can start a match: the matchmaker waits briefly for more humans,
+then fills remaining slots with simple bots so any mode is playable solo.
+
+## The 8 witches (`config/heroes.js`)
+
+| Witch | Passive | Effect |
+|---|---|---|
+| Ice | Frostbite | consecutive hits build frost, then slow |
+| Lightning | Static Charge | moving builds charge that boosts the next hit |
+| Fire | Inferno | kills briefly increase fire rate |
+| Blood | Bloodlust | kills restore health |
+| Voodoo | Toxic Touch | hits apply poison stacks (DoT) |
+| Halo | Divine Grace | regenerate HP while out of combat |
+| Brujeria | Umbral Veil | partial stealth while still + not firing |
+| Earth | Stoneguard | reduced damage while crouched / stationary |
+
+Each hero has two weapons (slots 1/2), a tactical/special/movement ability and
+an ultimate. All stats (damage, range, fire rate, mag, cooldowns, effects) are
+pure data, so balancing is config-only.
+
+## Controls (Unity client)
+
+| Control | Action | Control | Action |
+|---|---|---|---|
+| LMB | Primary fire | Shift | Movement ability (dash) |
+| RMB | Secondary fire / ADS | Q | Ultimate |
+| R | Reload | V | Melee |
+| F | Tactical ability | Space | Jump |
+| E | Special ability | Ctrl | Crouch / slide |
+| 1 / 2 | Weapon switch | Tab | Scoreboard (hold) |
+| Enter | Focus chat · C toggle | Esc | Release cursor / leave queue |
 
 ## Server setup
 
@@ -42,92 +74,85 @@ npm start                 # listens on PORT (default 8080)
 
 `.env` options: `PORT`, `LOG_LEVEL`, `LOG_TO_FILE`, `PAYLOAD_SECRET` (XOR fallback key).
 
-Endpoints: `GET /health` (status + DB stats), `GET /api/errors`,
+Endpoints: `GET /health` (status + DB + live arena stats), `GET /api/errors`,
 `GET /api/db/stats`, `POST /api/db/backup`.
 
 Verify it works:
 
 ```powershell
-node test-client.js    # 27 e2e checks: login, chat, quest, PvP match, restore
+node test-client.js    # 28 e2e checks: login, catalog, FFA match, combat, abilities, restore
 npx eslint .           # lint
 ```
 
-### Protocol (flat JSON; key = message type)
+## Protocol (flat JSON; key = message type)
 
 Outbound from client:
 
 | Message | Payload |
 |---|---|
-| `LOGIN` | `{LOGIN:true, displayName:"Ash"}` (optional `playerId`) |
-| `RESTORE_SESSION` | `{RESTORE_SESSION:true, playerId, sessionToken}` |
-| `message` | `{message:"hello"}` — global chat |
-| `MOVE` | `{MOVE:{x,y,z,yaw}}` — ~10 Hz position reports |
-| `SHOOT` | `{SHOOT:{targetId}}` — client raycast hit; server validates range/rate |
-| `JOIN_QUEUE` / `LEAVE_QUEUE` / `TAP` | tap-duel matchmaking (30 s matches) |
-| `REQUEST_DAILY_QUEST` / `REPORT_ENEMY_KILL` / `GET_KILL_STATS` / `VERIFY_QUEST_COMPLETION` | quests |
-| `TEAM_STATUS` / `GET_LEADERBOARD` | team info + rankings |
+| `LOGIN` / `RESTORE_SESSION` | auth (returns to the menu; no world join) |
+| `GET_CATALOG` | request modes + hero list for the menu |
+| `JOIN_MATCHMAKING` | `{mode}` — e.g. `{mode:"ffa"}` |
+| `LEAVE_MATCHMAKING` | cancel the queue / lobby |
+| `SELECT_HERO` / `LOCK_HERO` | `{heroId}` during hero select |
+| `MOVE` | `{x,y,z,yaw,crouch}` — ~10 Hz position reports |
+| `PRIMARY_FIRE` / `SECONDARY_FIRE` | `{targetId}` — client raycast hit |
+| `RELOAD` / `MELEE` / `WEAPON_SWITCH` | combat (`MELEE {targetId}`, `WEAPON_SWITCH {slot}`) |
+| `ABILITY` | `{slot}` — `tactical` / `special` / `movement` / `ultimate` |
+| `message` | global chat |
 
-Inbound to client: `LOGIN_COMPLETE` (+`spawn`), `SESSION_RESTORED`,
-`CHAT_MESSAGE`, `WORLD_STATE` (10 Hz snapshot of all players — authoritative;
-each entry carries `x,y,z,yaw,hp,alive`), `PLAYER_KILLED` (kill feed),
-`QUEUE_WAITING`, `MATCH_FOUND`, `MATCH_UPDATE`, `MATCH_RESULTS`,
-`MATCH_FORFEIT`, `DAILY_QUEST`, `QUEST_COMPLETED`, `KILL_STATS`,
-`TEAM_STATUS`, `LEADERBOARD`, `DUPLICATE_CONNECTION`, `*_ERROR` variants.
+Inbound to client: `LOGIN_COMPLETE`, `SESSION_RESTORED`, `CATALOG`,
+`QUEUE_STATUS`, `HERO_SELECT_STATE`, `MATCH_START` (+`spawn`,`hero`,`roster`),
+`WORLD_STATE` (10 Hz arena snapshot — each entry carries
+`x,y,z,yaw,crouch,hp,maxHp,shield,alive,ammo,score,deaths,ultCharge,hero,fx`),
+`AMMO_STATE`, `RELOADING`, `COOLDOWN_STATE`, `ABILITY_USED`, `PLAYER_KILLED`,
+`MATCH_END` (+scoreboard), `CHAT_MESSAGE`, `DUPLICATE_CONNECTION`, `*_ERROR`.
 
-### Combat rules (server-enforced)
+### Authority
 
-100 HP, 20 damage per hit, 60-unit range, 300 ms fire rate — all validated
-server-side. Eliminated players can't move or shoot and respawn at a new
-random point after 5 s. Kills add to `totalKills` and award loyalty points.
-
-Server replies are sent as **binary frames** (UTF-8 JSON) for Unity WebGL
-compatibility; plaintext or XOR-obfuscated payloads are accepted inbound.
+Movement, damage, ammo, fire rate, ability cooldowns, status effects (slow,
+poison, stun, shield, haste, stealth) and ultimate charge are all validated and
+owned server-side per arena. The client plays visuals (tracers, VFX, dash feel)
+and reports inputs. Server replies are binary frames (UTF-8 JSON) for Unity
+WebGL compatibility; plaintext or XOR-obfuscated payloads are accepted inbound.
 
 ### Deploy
 
-`railway.json` is included — point Railway/Render/etc. at the repo root,
-set `PORT`, and it health-checks `/health`. Persistence lives under `data/`
-(`game.db` + JSON snapshots, autosaved every 5 min, daily backups via cron).
+`railway.json` is included — point Railway/Render/etc. at the repo root, set
+`PORT`, and it health-checks `/health`. Season/leaderboard persistence lives
+under `data/` (`game.db` + JSON snapshots, autosaved every 5 min, daily backups
+via cron).
 
 ## Unity client setup
 
-Requires Unity **6000.0.33f1** (URP). Everything is generated in code —
-no scene wiring:
+Requires Unity **6000.0.33f1** (URP). Everything is generated in code — no scene
+wiring:
 
 1. Open `unityclient/unityclient` in Unity Hub.
-2. Wait for packages to resolve — `manifest.json` pulls in
-   **NativeWebSocket** (git) and **Newtonsoft.Json**. If the git package
-   fails: Package Manager → + → Add package from git URL →
-   `https://github.com/endel/NativeWebSocket.git#upm`
+2. Wait for packages to resolve — `manifest.json` pulls in **NativeWebSocket**
+   (git) and **Newtonsoft.Json**. If the git package fails: Package Manager →
+   + → Add package from git URL → `https://github.com/endel/NativeWebSocket.git#upm`
 3. Press **Play**.
 
-A bootstrap spawns the world, network layer, and UI automatically:
+A bootstrap (`GameClientBootstrap`) spawns the backdrop world, network layer,
+HUD and menu automatically. Type a display name → **ENTER** → pick a mode → lock
+a witch → you spawn into the arena. The player object is created on
+`MATCH_START` and removed on `MATCH_END`.
 
-- Type a display name → **CONNECT** → server assigns `playerId`, team,
-  and spawn point → your FPS controller appears.
-- **WASD** move · **mouse** look · **LMB** shoot · **Space** jump · **Esc** release cursor
-- **Enter** focus chat / send · **C** or the CHAT button hides the panel
-- Other players appear as team-colored capsules with name tags + health
-  bars, interpolated from `WORLD_STATE` snapshots. Dying shows an overlay
-  and respawns you at a server-assigned point ~5 s later.
+Point the client at a remote server by changing `serverUrl` in `GameNetwork`
+(default `ws://localhost:8080`; use `wss://` in production).
 
-Session token persists in `PlayerPrefs`, so reopening the app restores
-your session (same playerId, team, stats).
+## Architecture notes
 
-Point the client at a remote server by changing `serverUrl` in
-`GameNetwork` (default `ws://localhost:8080`; use `wss://` in production).
+- `modules/arena/` — `arena-manager` (owns live arenas + matchmaker, ticks
+  them), `arena` (one match: world + abilities + bots + scoring + lifecycle),
+  `matchmaker` (per-mode queues, bot fill), `ability-system` (weapons, abilities,
+  status effects, passives), `bot` (simple fill AI).
+- `modules/world/world-state-manager.js` — per-arena authoritative player table.
+- `config/heroes.js`, `config/modes.js` — data-only hero + mode definitions.
+- Unity scripts: `GameNetwork` (protocol), `MenuUI` (+bootstrap), `GameUI` (HUD),
+  `FirstPersonController` (control kit), `RemotePlayerManager` (avatars),
+  `HeroCatalog` (client mirror), `UiKit` (programmatic UI), `WorldGenerator`.
 
-## Testing multiplayer locally
-
-1. `npm start` (server on :8080)
-2. Build the Unity client once (File → Build) **or** open a second editor
-   instance, then Play both — each sees the other's avatar move in real time.
-
-## Notes
-
-- Rate limit: 40 msgs/sec per client (movement needs headroom).
-- Movement authority: server validates bounds + max speed and rebroadcasts;
-  remote clients only render server-accepted positions.
-- Combat authority: hit detection is client raycast + server range/fire-rate
-  validation; damage, death, and respawn are server-owned.
-- See `BASIC_TEMPLATE_NO_CRYPTO.md` for the original architecture spec.
+This is a Phase 1 vertical slice (FFA). Team modes (2v2/3v3/5v5) and polish are
+staged next; see the ability/mode configs for the gated definitions.

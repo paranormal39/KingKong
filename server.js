@@ -19,8 +19,8 @@ const { expressErrorHandler } = require('./utils/errors');
 // Team System
 const TeamManager = require('./modules/teams/team-manager');
 
-// World state (server-authoritative player positions)
-const WorldStateManager = require('./modules/world/world-state-manager');
+// Arena system (instanced match rooms + matchmaking + bots)
+const ArenaManager = require('./modules/arena/arena-manager');
 
 // Modular WebSocket System
 const { getRouter, getClientManager } = require('./modules/websocket');
@@ -31,13 +31,13 @@ const { getRouter, getClientManager } = require('./modules/websocket');
 
 const teamManager = new TeamManager();
 const clientManager = getClientManager();
-const worldState = new WorldStateManager();
+const arenaManager = new ArenaManager(clientManager, teamManager);
 
 // Services object passed to all handlers
 const services = {
   teamManager,
   clientManager,
-  worldState,
+  arenaManager,
   config: CONFIG
 };
 
@@ -83,6 +83,7 @@ app.get('/health', async (req, res) => {
     database: dbHealth,
     teams: teamManager.teams.size,
     players: teamManager.players.size,
+    arenas: arenaManager.getStats(),
     handlers: router.getStats().handlers.length,
     clients: router.getStats().clients
   });
@@ -156,10 +157,10 @@ setInterval(() => {
   clientManager.checkDeadConnections();
 }, CONFIG.PING_INTERVAL);
 
-// World-state broadcast - authoritative player positions to all logged-in clients
+// Arena tick - advance every live match (combat, abilities, bots, broadcasts)
 setInterval(() => {
-  worldState.broadcast(clientManager);
-}, CONFIG.WORLD.TICK_MS);
+  arenaManager.tickAll();
+}, CONFIG.ARENA.TICK_MS);
 
 // Daily maintenance
 cron.schedule('0 1 * * *', () => {

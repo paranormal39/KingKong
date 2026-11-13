@@ -1,7 +1,8 @@
 /**
  * Presence Handler
- * Player world-state messages:
- * - MOVE: report position (server validates + stores; broadcast on tick)
+ * Player world-state messages (arena-scoped):
+ * - MOVE: report position + crouch (routed to the player's arena; validated
+ *   server-side; the arena's world-state broadcast is the reply).
  */
 const BaseHandler = require('./base-handler');
 const logger = require('../../utils/logger');
@@ -17,36 +18,32 @@ class PresenceHandler extends BaseHandler {
   }
 
   /**
-   * MOVE message: { MOVE: { x, y, z, yaw } }
-   * No response - the world-state broadcast is the reply.
+   * MOVE message: { MOVE: { x, y, z, yaw, crouch } }
+   * No direct response - the arena world-state broadcast is the reply.
    */
   async handleMove(context) {
-    const playerId = this.requirePlayer(context, 'Must be logged in to move');
-    const { worldState } = context.services;
+    const playerId = this.requirePlayer(context, 'Must be in a match to move');
+    const { arenaManager } = context.services;
 
-    // Accept { MOVE: { x, y, z, yaw } } and flat { MOVE: true, x, y, z, yaw }
     const moveData = (context.message.MOVE && typeof context.message.MOVE === 'object')
       ? context.message.MOVE
       : context.message;
 
-    const accepted = worldState.updatePosition(playerId, moveData);
-    if (!accepted) {
-      logger.debug('PRESENCE', `Move rejected for ${playerId}`);
-    }
+    arenaManager.routeMove(playerId, moveData);
   }
 
   /**
-   * Clean up world presence when a client disconnects.
+   * Clean up matchmaking + arena presence when a client disconnects.
    */
   onDisconnect(clientid) {
-    const { worldState, clientManager } = this.services || {};
-    if (!worldState) return;
+    const { arenaManager, clientManager } = this.services || {};
+    if (!arenaManager) return;
 
     const client = clientManager?.getClient(clientid);
     if (client?.playerId) {
-      worldState.removePlayer(client.playerId);
+      arenaManager.onPlayerLeft(client.playerId);
     } else {
-      worldState.removePlayerByClient(clientid);
+      logger.debug('PRESENCE', `Disconnect for ${clientid} with no playerId`);
     }
   }
 }

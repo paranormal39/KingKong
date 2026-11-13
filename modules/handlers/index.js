@@ -8,7 +8,7 @@ const logger = require('../../utils/logger');
 // Import all handlers
 const SessionHandler = require('./session-handler');
 const ChatHandler = require('./chat-handler');
-const PvPHandler = require('./pvp-handler');
+const MatchmakingHandler = require('./matchmaking-handler');
 const QuestHandler = require('./quest-handler');
 const TeamHandler = require('./team-handler');
 const PresenceHandler = require('./presence-handler');
@@ -31,7 +31,7 @@ class HandlerRegistry {
     this.handlers = [
       new SessionHandler(),
       new ChatHandler(),
-      new PvPHandler(),
+      new MatchmakingHandler(),
       new QuestHandler(),
       new TeamHandler(),
       new PresenceHandler(),

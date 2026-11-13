@@ -1,8 +1,8 @@
 // Game Configuration Constants
 module.exports = {
   // Server Configuration
-  RATE_LIMIT_WINDOW: 1000, // 1 second window (movement packets need ~10/sec headroom)
-  RATE_LIMIT_MAX: 40, // 40 messages per second - flood protection, allows movement traffic
+  RATE_LIMIT_WINDOW: 1000, // 1 second window (movement + fire + abilities need headroom)
+  RATE_LIMIT_MAX: 60, // 60 messages per second - flood protection, allows movement + combat traffic
   MAX_MESSAGE_SIZE: 10000, // 10KB max message size
 
   // World state (server-authoritative player positions)
@@ -16,7 +16,7 @@ module.exports = {
     SPAWN_RADIUS: 8      // players spawn inside this radius at origin
   },
 
-  // Combat
+  // Combat (fallback defaults; per-hero weapon stats live in config/heroes.js)
   COMBAT: {
     MAX_HP: 100,
     SHOT_DAMAGE: 20,
@@ -26,11 +26,40 @@ module.exports = {
     KILL_LOYALTY: 5         // loyalty points per elimination
   },
 
+  // Arena / match instances
+  ARENA: {
+    TICK_MS: 100,            // per-arena world-state + effect tick (10 Hz)
+    QUEUE_WAIT_MS: 8000,     // wait for more humans before filling with bots
+    MIN_HUMANS_TO_START: 1,  // a single human can start a (bot-filled) match
+    EMPTY_CLOSE_MS: 10000,   // tear down an arena with no humans after this
+    RESULTS_LINGER_MS: 8000  // keep a finished arena alive to show results
+  },
+
+  // Abilities
+  ABILITY: {
+    SLOTS: ['tactical', 'special', 'movement', 'ultimate'],
+    ULT_CHARGE_PER_KILL: 35,     // ultimate charge gained per elimination
+    ULT_CHARGE_PER_SECOND: 4,    // passive ultimate charge over time
+    ULT_CHARGE_NEEDED: 100,      // charge required to use the ultimate
+    STATUS_TICK_MS: 500          // how often DoT / regen / zones tick
+  },
+
+  // Bots (simple AI fill) - deliberately imperfect so they feel fair
+  BOT: {
+    NAMES: ['Hex', 'Mystia', 'Raven', 'Circe', 'Morgana', 'Selene', 'Nyx', 'Wanda', 'Agatha', 'Lilith'],
+    THINK_MS: 350,           // AI decision interval (slower = more sluggish aim)
+    AGGRO_RANGE: 55,         // start shooting within this distance
+    MOVE_SPEED: 9,           // bot world movement speed (units/sec)
+    FIRE_JITTER: 0.45,       // chance a bot hesitates (skips firing) each think
+    ACCURACY: 0.45,          // chance a fired shot is actually on-target (else it whiffs)
+    REACTION_MS: 650,        // delay after spotting a new target before it can shoot
+    ABILITY_CHANCE: 0.1      // chance a bot uses an off-cooldown ability each think
+  },
+
   // Payload Obfuscation Configuration (XOR fallback - obfuscation only, not security)
   PAYLOAD_SECRET: process.env.PAYLOAD_SECRET || 'change-me',
 
   // Game Mechanics
-  MATCH_TIMEOUT: 30000, // 30 seconds
   PING_INTERVAL: 30000, // 30 seconds heartbeat sweep
 
   // Player identity

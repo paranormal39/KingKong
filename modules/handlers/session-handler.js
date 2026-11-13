@@ -83,15 +83,13 @@ class SessionHandler extends BaseHandler {
       client.usertoken = message.usertoken;
     }
 
-    // Ensure player exists + team assignment
+    // Ensure player exists + team assignment (season/leaderboard meta only)
     const player = teamManager.ensureTeam(playerId, displayName);
     player.displayName = displayName;
     teamManager.setSessionToken(playerId, client.sessionToken);
 
-    // Enter the world - server assigns the spawn position
-    const worldEntry = context.services.worldState
-      ? context.services.worldState.addPlayer(playerId, clientid, displayName, player.teamId)
-      : null;
+    // Login just authenticates; players enter a world via matchmaking + an
+    // arena. No shared world is joined here.
 
     const team = teamManager.getTeamById(player.teamId);
     const currentSeason = teamManager.getCurrentSeason();
@@ -103,7 +101,6 @@ class SessionHandler extends BaseHandler {
         team: player.teamId,
         teamDetails: team ? { id: team.id, name: team.name, color: team.color, members: team.members } : null,
         sessionToken: client.sessionToken,
-        spawn: worldEntry ? { x: worldEntry.x, y: worldEntry.y, z: worldEntry.z } : null,
         stats: {
           loyaltyPoints: player.loyaltyPoints,
           rank: player.rank,
@@ -193,10 +190,8 @@ class SessionHandler extends BaseHandler {
       client.usertoken = message.usertoken;
     }
 
-    // Re-enter the world at a fresh spawn point
-    const worldEntry = context.services.worldState
-      ? context.services.worldState.addPlayer(playerId, clientid, client.playerName, player.teamId)
-      : null;
+    // Session restore just re-authenticates; the player returns to the menu
+    // and re-enters play via matchmaking.
 
     const team = teamManager.getTeamById(player.teamId);
     const currentSeason = teamManager.getCurrentSeason();
@@ -214,7 +209,6 @@ class SessionHandler extends BaseHandler {
           color: team.color,
           members: team.members
         } : null,
-        spawn: worldEntry ? { x: worldEntry.x, y: worldEntry.y, z: worldEntry.z } : null,
         stats: {
           loyaltyPoints: player.loyaltyPoints,
           rank: player.rank,
