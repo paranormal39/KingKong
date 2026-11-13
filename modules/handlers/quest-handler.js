@@ -2,9 +2,12 @@
  * Quest Handler
  * Handles quest-related messages:
  * - REQUEST_DAILY_QUEST
- * - REPORT_ENEMY_KILL
  * - GET_KILL_STATS
  * - VERIFY_QUEST_COMPLETION
+ *
+ * Kill progress is tracked server-side from real gameplay kills
+ * (teamManager.recordGameplayKill, called by arenas) — clients no longer
+ * self-report kills.
  */
 const BaseHandler = require('./base-handler');
 const logger = require('../../utils/logger');
@@ -98,7 +101,6 @@ class QuestHandler extends BaseHandler {
 
   registerHandlers() {
     this.register('REQUEST_DAILY_QUEST', this.handleRequestDailyQuest.bind(this));
-    this.register('REPORT_ENEMY_KILL', this.handleReportEnemyKill.bind(this));
     this.register('GET_KILL_STATS', this.handleGetKillStats.bind(this));
     this.register('VERIFY_QUEST_COMPLETION', this.handleVerifyQuestCompletion.bind(this));
   }
@@ -135,92 +137,6 @@ class QuestHandler extends BaseHandler {
     });
 
     logger.info('QUEST', `Quest generated for ${playerId} - ${quest.title}`);
-  }
-
-  /**
-   * Report enemy kills for quest progress
-   */
-  async handleReportEnemyKill(context) {
-    const { message, ws, clientid, clientList } = context;
-    const { teamManager } = context.services;
-
-    const playerId = this.requirePlayer(context);
-    const player = teamManager.ensureTeam(playerId);
-
-    // Accept both { REPORT_ENEMY_KILL: { enemyType, killCount, questId } }
-    // and flat { REPORT_ENEMY_KILL: true, enemyType, killCount, questId }
-    const killData = (message.REPORT_ENEMY_KILL && typeof message.REPORT_ENEMY_KILL === 'object')
-      ? message.REPORT_ENEMY_KILL
-      : message;
-    const { enemyType, killCount, questId } = killData;
-    const kills = killCount || 1;
-
-    // In-memory kill detail (totalKills is persisted on the player record)
-    if (!player.questKills) player.questKills = {};
-    if (!player.killsByType) player.killsByType = {};
-
-    teamManager.recordKills(playerId, kills);
-    if (enemyType) {
-      player.killsByType[enemyType] = (player.killsByType[enemyType] || 0) + kills;
-    }
-
-    // Track quest progress
-    let questCompleted = false;
-    let questReward = null;
-    let questData = null;
-
-    // Check the client's active quest
-    const clientData = clientList.get(clientid);
-    const activeQuest = clientData?.activeQuest;
-    const targetQuestId = questId || activeQuest?.id;
-
-    if (targetQuestId && activeQuest && activeQuest.id === targetQuestId) {
-      // Check if enemy type matches (no type = counts for any quest)
-      if (!enemyType || activeQuest.enemies === enemyType || activeQuest.enemies?.includes(enemyType)) {
-        player.questKills[targetQuestId] = (player.questKills[targetQuestId] || 0) + kills;
-        this.persistQuestProgress(teamManager, playerId, targetQuestId, player.questKills[targetQuestId], false);
-
-        const result = await this.checkQuestCompletion(
-          context, playerId, targetQuestId, player.questKills[targetQuestId], activeQuest
-        );
-        if (result.completed) {
-          questCompleted = true;
-          questReward = result.reward;
-          questData = activeQuest;
-          activeQuest.status = 'completed';
-        }
-      }
-    }
-
-    // Build response
-    const response = {
-      KILL_REPORT_RECEIVED: {
-        success: true,
-        killsReported: kills,
-        enemyType: enemyType || 'unknown',
-        totalLifetimeKills: player.totalKills,
-        questProgress: targetQuestId ? {
-          questId: targetQuestId,
-          currentKills: player.questKills[targetQuestId] || 0,
-          requiredKills: questData?.enemyCount || activeQuest?.enemyCount || 0
-        } : null,
-        timestamp: new Date().toISOString()
-      }
-    };
-
-    if (questCompleted) {
-      response.QUEST_COMPLETED = {
-        questId: questData?.id || targetQuestId,
-        questTitle: questData?.title || 'Quest',
-        reward: questReward,
-        message: `Quest Complete! "${questData?.title}" - You earned ${questReward.coins} coins and ${questReward.xp} XP!`,
-        newCoinBalance: player.coins,
-        timestamp: new Date().toISOString()
-      };
-    }
-
-    this.sendAsBytes(ws, response);
-    logger.info('KILLS', `${playerId} reported ${kills} ${enemyType || 'enemy'} kills. Total: ${player.totalKills}`);
   }
 
   /**

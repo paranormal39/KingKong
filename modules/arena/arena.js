@@ -271,12 +271,34 @@ class Arena {
       }
     });
 
-    // Persist real players' kill stats (ignore bots)
+    // Persist real players' kill stats (ignore bots) + advance quest progress
     const killerMember = this.members.get(killerId);
     if (killerMember && !killerMember.isBot && this.teamManager) {
       try {
-        this.teamManager.recordKills(killerId, 1);
         this.teamManager.addLoyaltyPoints(killerId, CONFIG.COMBAT.KILL_LOYALTY, 'arena_kill');
+        const client = killerMember.clientId ? this.clientManager.getClient(killerMember.clientId) : null;
+        const qres = this.teamManager.recordGameplayKill(killerId, client?.activeQuest);
+        if (qres && qres.quest) {
+          this.sendTo(killerId, {
+            QUEST_UPDATE: {
+              questId: qres.quest.id,
+              questTitle: qres.quest.title,
+              kills: qres.kills,
+              required: qres.required,
+              completed: qres.completed
+            }
+          });
+          if (qres.completed) {
+            this.sendTo(killerId, {
+              QUEST_COMPLETED: {
+                questId: qres.quest.id,
+                questTitle: qres.quest.title,
+                reward: qres.reward,
+                message: `Quest Complete! "${qres.quest.title}"`
+              }
+            });
+          }
+        }
       } catch (err) {
         logger.warn('ARENA', `Failed to record kill: ${err.message}`);
       }
@@ -362,16 +384,52 @@ class Arena {
     this.state = 'ended';
     this.closeAt = Date.now() + CONFIG.ARENA.RESULTS_LINGER_MS;
 
+    const scoreboard = this.scoreboard();
     const results = {
       MATCH_END: {
         arenaId: this.id,
         mode: this.mode.id,
         winner,
-        scoreboard: this.scoreboard()
+        scoreboard
       }
     };
     this.broadcast(results);
+    this.recordResults(winner, scoreboard);
     logger.info('ARENA', `${this.id} ended. Winner: ${winner ? `${winner.type}:${winner.id}` : 'none'}`);
+  }
+
+  /**
+   * Apply season scoring to every human participant and persist the match.
+   * FFA: only the player named by winner wins; everyone else loses.
+   * Team modes: every member of the winning side wins.
+   */
+  recordResults(winner, scoreboard) {
+    if (!this.teamManager) return;
+    const humans = scoreboard.filter(s => !s.isBot);
+    if (!humans.length) return;
+
+    for (const s of humans) {
+      const won = this.mode.teams <= 1
+        ? (winner?.type === 'player' && winner.id === s.playerId)
+        : (winner?.type === 'team' && winner.id === s.team);
+      try {
+        this.teamManager.applyMatchOutcome(s.playerId, won);
+      } catch (err) {
+        logger.warn('ARENA', `Failed to record outcome for ${s.playerId}: ${err.message}`);
+      }
+    }
+
+    if (this.teamManager.isDbInitialized) {
+      this.teamManager.databaseManager.saveMatch({
+        matchId: this.id,
+        mode: this.mode.id,
+        winnerType: winner?.type || null,
+        winnerId: winner?.id || null,
+        humans: humans.length,
+        durationMs: this.startTime ? Date.now() - this.startTime : 0,
+        scoreboard
+      }).catch(err => logger.warn('ARENA', `Failed to save match record: ${err.message}`));
+    }
   }
 
   scoreboard() {

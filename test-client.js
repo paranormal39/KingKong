@@ -62,6 +62,7 @@ async function main() {
   check('ash got LOGIN_COMPLETE', !!loginA);
   check('ash got sessionToken', !!loginA?.LOGIN_COMPLETE?.sessionToken);
   check('login no longer returns a spawn', loginA?.LOGIN_COMPLETE?.spawn === undefined);
+  check('first-time login grants a daily quest', !!lastOf(a, 'DAILY_QUEST'));
   const token = loginA?.LOGIN_COMPLETE?.sessionToken;
 
   // 3. Bad login rejected
@@ -97,14 +98,16 @@ async function main() {
   const hs = await waitFor(a, 'HERO_SELECT_STATE', 11000);
   check('HERO_SELECT_STATE received after queue wait', !!hs);
 
-  send(a, { SELECT_HERO: { heroId: 'fire' } });
+  // Ice witch: 70u-range primary + auto-reload makes the bot-kill section
+  // below deterministic (bots close to aggro range well inside it).
+  send(a, { SELECT_HERO: { heroId: 'ice' } });
   await sleep(200);
-  send(a, { LOCK_HERO: { heroId: 'fire' } });
+  send(a, { LOCK_HERO: { heroId: 'ice' } });
 
   const ms = await waitFor(a, 'MATCH_START', 5000);
   check('MATCH_START received', !!ms);
   check('MATCH_START has a spawn', !!ms?.MATCH_START?.spawn);
-  check('locked hero is fire', ms?.MATCH_START?.hero === 'fire');
+  check('locked hero is ice', ms?.MATCH_START?.hero === 'ice');
   const roster = ms?.MATCH_START?.roster || [];
   const bots = roster.filter(r => r.isBot);
   check('bots filled the FFA lobby', bots.length >= 1);
@@ -127,7 +130,7 @@ async function main() {
   await sleep(500);
   const ammo = await waitFor(a, 'AMMO_STATE', 1500);
   check('PRIMARY_FIRE returns AMMO_STATE', !!ammo);
-  check('ammo decreased from firing', ammo?.AMMO_STATE?.ammo < 40);
+  check('ammo decreased from firing', ammo?.AMMO_STATE?.ammo < 18);
   check('RELOAD acknowledged', !!lastOf(a, 'RELOADING'));
   check('ABILITY tactical confirmed (COOLDOWN_STATE)', !!lastOf(a, 'COOLDOWN_STATE'));
   check('ability broadcast as ABILITY_USED', !!lastOf(a, 'ABILITY_USED'));
@@ -145,6 +148,28 @@ async function main() {
   } else {
     check('firing at a bot deals damage', false);
   }
+
+  // 9c. A real kill advances the active quest server-side: keep firing at
+  //     the nearest living bot until QUEST_UPDATE arrives (quest progress
+  //     comes from recorded kills now, not client-reported messages).
+  const aliveBots = () =>
+    (lastOf(a, 'WORLD_STATE')?.WORLD_STATE?.players || []).filter(p => p.isBot && p.alive !== false);
+  let sawQuestUpdate = false;
+  for (let i = 0; i < 40 && !sawQuestUpdate; i++) {
+    const targets = aliveBots();
+    if (!targets.length) break;
+    send(a, { PRIMARY_FIRE: { targetId: targets[0].playerId } });
+    await sleep(300);
+    sawQuestUpdate = !!lastOf(a, 'QUEST_UPDATE');
+  }
+  check('kill sends QUEST_UPDATE for active quest', sawQuestUpdate);
+
+  send(a, { GET_KILL_STATS: true });
+  await sleep(400);
+  const ks = lastOf(a, 'KILL_STATS');
+  check('GET_KILL_STATS shows the arena kill', (ks?.KILL_STATS?.totalLifetimeKills || 0) >= 1);
+  check('quest kill progress persisted server-side',
+    Object.keys(ks?.KILL_STATS?.questKillProgress || {}).length >= 1);
 
   // 10. Session restore (returns to menu, no spawn)
   const a2 = await connect('ash2');

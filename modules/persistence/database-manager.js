@@ -36,6 +36,16 @@ class DatabaseManager {
   }
 
   async createTables() {
+    // Migrate the legacy tap-duel matches table (player1/player2/p1_taps)
+    // out of the way before creating the arena-shaped one. Old rows are
+    // preserved under matches_legacy.
+    const matchCols = await this.all('PRAGMA table_info(matches)');
+    if (matchCols.some(c => c.name === 'p1_taps')) {
+      await this.run('ALTER TABLE matches RENAME TO matches_legacy');
+      await this.run('DROP INDEX IF EXISTS idx_matches_players');
+      logger.info('DB', 'Migrated legacy matches table to matches_legacy');
+    }
+
     const tables = [
       // Players table
       `CREATE TABLE IF NOT EXISTS players (
@@ -75,14 +85,15 @@ class DatabaseManager {
         PRIMARY KEY (player_id, quest_id)
       )`,
 
-      // Match history table
+      // Match history table (arena matches; scoreboard is a JSON array)
       `CREATE TABLE IF NOT EXISTS matches (
         match_id TEXT PRIMARY KEY,
-        player1 TEXT,
-        player2 TEXT,
-        winner TEXT,
-        p1_taps INTEGER DEFAULT 0,
-        p2_taps INTEGER DEFAULT 0,
+        mode TEXT,
+        winner_type TEXT,
+        winner_id TEXT,
+        humans INTEGER DEFAULT 0,
+        duration_ms INTEGER DEFAULT 0,
+        scoreboard TEXT,
         played_at TEXT
       )`
     ];
@@ -97,7 +108,7 @@ class DatabaseManager {
       'CREATE INDEX IF NOT EXISTS idx_players_loyalty ON players(loyalty_points DESC)',
       'CREATE INDEX IF NOT EXISTS idx_players_session_token ON players(session_token)',
       'CREATE INDEX IF NOT EXISTS idx_quests_player ON quests(player_id)',
-      'CREATE INDEX IF NOT EXISTS idx_matches_players ON matches(player1, player2)'
+      'CREATE INDEX IF NOT EXISTS idx_matches_played ON matches(played_at)'
     ];
 
     for (const index of indexes) {
@@ -279,28 +290,32 @@ class DatabaseManager {
   // Match operations
   async saveMatch(match) {
     const sql = `
-      INSERT OR REPLACE INTO matches (match_id, player1, player2, winner, p1_taps, p2_taps, played_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT OR REPLACE INTO matches (match_id, mode, winner_type, winner_id, humans, duration_ms, scoreboard, played_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `;
     return this.run(sql, [
       match.matchId,
-      match.player1,
-      match.player2,
-      match.winner,
-      match.p1Taps || 0,
-      match.p2Taps || 0,
+      match.mode || null,
+      match.winnerType || null,
+      match.winnerId || null,
+      match.humans || 0,
+      match.durationMs || 0,
+      JSON.stringify(match.scoreboard || []),
       match.playedAt || new Date().toISOString()
     ]);
   }
 
   async getPlayerMatches(playerId, limit = 20) {
+    // playerId is restricted to [A-Za-z0-9_]; escape '_' so it can't act as
+    // a LIKE wildcard inside the JSON scoreboard.
+    const pattern = `%"playerId":"${String(playerId).replace(/_/g, '\\_')}"%`;
     const sql = `
       SELECT * FROM matches
-      WHERE player1 = ? OR player2 = ?
+      WHERE scoreboard LIKE ? ESCAPE '\\'
       ORDER BY played_at DESC
       LIMIT ?
     `;
-    return this.all(sql, [playerId, playerId, limit]);
+    return this.all(sql, [pattern, limit]);
   }
 
   // ============================================
@@ -425,17 +440,17 @@ class DatabaseManager {
     // Match stats
     const matchStats = await this.get(`
       SELECT COUNT(*) as total,
-             SUM(CASE WHEN winner IS NULL OR winner = '' THEN 1 ELSE 0 END) as ties
+             SUM(CASE WHEN winner_id IS NULL OR winner_id = '' THEN 1 ELSE 0 END) as ties
       FROM matches
     `);
     stats.matches = matchStats;
 
-    // Recent activity
-    const recentMatches = await this.get(`
-      SELECT COUNT(*) as count
-      FROM matches
-      WHERE played_at > datetime('now', '-24 hours')
-    `);
+    // Recent activity (played_at is stored as an ISO-8601 string)
+    const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const recentMatches = await this.get(
+      'SELECT COUNT(*) as count FROM matches WHERE played_at > ?',
+      [cutoff]
+    );
     stats.last24Hours = {
       matches: recentMatches?.count || 0
     };

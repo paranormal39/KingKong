@@ -108,6 +108,13 @@ Inbound to client: `LOGIN_COMPLETE`, `SESSION_RESTORED`, `CATALOG`,
 `AMMO_STATE`, `RELOADING`, `COOLDOWN_STATE`, `ABILITY_USED`, `PLAYER_KILLED`,
 `MATCH_END` (+scoreboard), `CHAT_MESSAGE`, `DUPLICATE_CONNECTION`, `*_ERROR`.
 
+Menu/meta messages: `REQUEST_DAILY_QUEST` → `DAILY_QUEST`,
+`GET_KILL_STATS` → `KILL_STATS`, `VERIFY_QUEST_COMPLETION` →
+`QUEST_VERIFICATION_RESULT`, `TEAM_STATUS`, `GET_LEADERBOARD` →
+`LEADERBOARD`. Arena kills push `QUEST_UPDATE` / `QUEST_COMPLETED` to the
+killer automatically — quest progress is tracked server-side, not
+client-reported.
+
 ### Authority
 
 Movement, damage, ammo, fire rate, ability cooldowns, status effects (slow,
@@ -115,6 +122,11 @@ poison, stun, shield, haste, stealth) and ultimate charge are all validated and
 owned server-side per arena. The client plays visuals (tracers, VFX, dash feel)
 and reports inputs. Server replies are binary frames (UTF-8 JSON) for Unity
 WebGL compatibility; plaintext or XOR-obfuscated payloads are accepted inbound.
+
+Match results feed the persistent meta: `MATCH_END` applies win/loss
+(`pvpWins`/`pvpLosses`) + season points to each human's team, persists the
+scoreboard to the `matches` table, and arena kills advance the killer's
+active quest and loyalty.
 
 ### Deploy
 

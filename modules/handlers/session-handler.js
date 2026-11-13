@@ -87,6 +87,7 @@ class SessionHandler extends BaseHandler {
     const player = teamManager.ensureTeam(playerId, displayName);
     player.displayName = displayName;
     teamManager.setSessionToken(playerId, client.sessionToken);
+    await this.hydrateQuestProgress(teamManager, player);
 
     // Login just authenticates; players enter a world via matchmaking + an
     // arena. No shared world is joined here.
@@ -190,6 +191,8 @@ class SessionHandler extends BaseHandler {
       client.usertoken = message.usertoken;
     }
 
+    await this.hydrateQuestProgress(teamManager, player);
+
     // Session restore just re-authenticates; the player returns to the menu
     // and re-enters play via matchmaking.
 
@@ -249,6 +252,22 @@ class SessionHandler extends BaseHandler {
       }
     }
     return false;
+  }
+
+  // Reload persisted per-quest kill counts into the player record so
+  // quest progress survives restarts (the quests table only stores
+  // progress rows, not the quest objects themselves).
+  async hydrateQuestProgress(teamManager, player) {
+    if (!teamManager.isDbInitialized || !player) return;
+    try {
+      const rows = await teamManager.databaseManager.getPlayerQuests(player.playerId);
+      if (!player.questKills) player.questKills = {};
+      for (const row of rows) {
+        player.questKills[row.quest_id] = Math.max(player.questKills[row.quest_id] || 0, row.progress || 0);
+      }
+    } catch (err) {
+      logger.warn('QUEST', `Failed to load quest progress for ${player.playerId}: ${err.message}`);
+    }
   }
 
   async persistQuestAssignment(teamManager, playerId, quest) {

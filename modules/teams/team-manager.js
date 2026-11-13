@@ -215,41 +215,44 @@ class TeamManager extends EventEmitter {
       return;
     }
 
-    const winPoints = CONFIG.SCORING.pvpWin;
-    const lossPoints = CONFIG.SCORING.pvpLoss;
-
-    winner.pvpWins++;
-    loser.pvpLosses++;
-
-    winner.loyaltyPoints += winPoints;
-    loser.loyaltyPoints = Math.max(0, loser.loyaltyPoints + lossPoints);
-
-    const winnerTeam = this.teams.get(winner.teamId);
-    const loserTeam = this.teams.get(loser.teamId);
-
-    if (winnerTeam) {
-      winnerTeam.seasonPoints += winPoints;
-      winnerTeam.totalLoyaltyPoints += winPoints;
-    }
-    if (loserTeam) {
-      loserTeam.seasonPoints = Math.max(0, loserTeam.seasonPoints + lossPoints);
-      loserTeam.totalLoyaltyPoints = Math.max(0, loserTeam.totalLoyaltyPoints + lossPoints);
-    }
-
-    this.updatePlayerRank(winner);
-    this.updatePlayerRank(loser);
-
-    this.persistPlayer(winner);
-    this.persistPlayer(loser);
-    if (winnerTeam) this.persistTeam(winnerTeam);
-    if (loserTeam) this.persistTeam(loserTeam);
+    this.applyMatchOutcome(winnerId, true);
+    this.applyMatchOutcome(loserId, false);
 
     logger.info('TEAM', `PvP result: ${winnerId} (${winner.teamId}) beat ${loserId} (${loser.teamId})`);
 
     this.emit('pvpResultRecorded', {
-      winner: { playerId: winnerId, teamId: winner.teamId, pointsGained: winPoints },
-      loser: { playerId: loserId, teamId: loser.teamId, pointsLost: Math.abs(lossPoints) }
+      winner: { playerId: winnerId, teamId: winner.teamId, pointsGained: CONFIG.SCORING.pvpWin },
+      loser: { playerId: loserId, teamId: loser.teamId, pointsLost: Math.abs(CONFIG.SCORING.pvpLoss) }
     });
+  }
+
+  /**
+   * Apply a win/loss to one player: pvp record, season scoring for the
+   * player + their team, rank re-eval, persistence. Works for any match
+   * shape (FFA placement, team modes, pairwise duels).
+   */
+  applyMatchOutcome(playerId, won) {
+    const player = this.players.get(playerId);
+    if (!player) {
+      logger.warn('TEAM', `Match outcome for unknown player: ${playerId}`);
+      return;
+    }
+
+    const points = won ? CONFIG.SCORING.pvpWin : CONFIG.SCORING.pvpLoss;
+    if (won) player.pvpWins++; else player.pvpLosses++;
+    player.loyaltyPoints = Math.max(0, player.loyaltyPoints + points);
+
+    const team = this.teams.get(player.teamId);
+    if (team) {
+      team.seasonPoints = Math.max(0, team.seasonPoints + points);
+      team.totalLoyaltyPoints = Math.max(0, team.totalLoyaltyPoints + points);
+      this.persistTeam(team);
+    }
+
+    this.updatePlayerRank(player);
+    this.persistPlayer(player);
+
+    logger.info('TEAM', `Match outcome: ${playerId} ${won ? 'won' : 'lost'} (${points > 0 ? '+' : ''}${points} pts)`);
   }
 
   recordPvPTie(player1Id, player2Id) {
@@ -292,12 +295,49 @@ class TeamManager extends EventEmitter {
   }
 
   /**
-   * Record enemy kills for a player
+   * Record a real gameplay kill (e.g. an arena elimination). Bumps lifetime
+   * kills and, when the killer's connection carries an active quest,
+   * advances its kill progress and completes it when the target is met.
+   * Returns { quest, kills, required, completed, reward? } or null.
    */
-  recordKills(playerId, killCount) {
+  recordGameplayKill(playerId, activeQuest) {
     const player = this.players.get(playerId);
-    if (!player) return;
-    player.totalKills += killCount;
+    if (!player) return null;
+    player.totalKills += 1;
+
+    let result = null;
+    const questLive = activeQuest &&
+      activeQuest.status === 'active' &&
+      (!activeQuest.expires || new Date(activeQuest.expires) > new Date());
+
+    if (questLive && activeQuest.enemyCount > 0) {
+      if (!player.questKills) player.questKills = {};
+      const kills = (player.questKills[activeQuest.id] || 0) + 1;
+      player.questKills[activeQuest.id] = kills;
+      this.persistQuestProgress(playerId, activeQuest.id, kills, false);
+
+      result = { quest: activeQuest, kills, required: activeQuest.enemyCount, completed: false };
+
+      if (!activeQuest.completedBy) activeQuest.completedBy = [];
+      if (kills >= activeQuest.enemyCount && !activeQuest.completedBy.includes(playerId)) {
+        activeQuest.completedBy.push(playerId);
+        activeQuest.status = 'completed';
+        this.recordQuestCompletion(playerId, activeQuest.reward);
+        this.persistQuestProgress(playerId, activeQuest.id, kills, true);
+        result.completed = true;
+        result.reward = activeQuest.reward;
+      }
+    }
+
+    this.persistPlayer(player);
+    return result;
+  }
+
+  persistQuestProgress(playerId, questId, progress, completed) {
+    if (!this.isDbInitialized) return;
+    this.databaseManager.saveQuestProgress(
+      playerId, questId, progress, completed, new Date().toISOString()
+    ).catch(err => logger.warn('TEAM', `Failed to persist quest progress: ${err.message}`));
   }
 
   addLoyaltyPoints(playerId, points, reason = 'general') {
