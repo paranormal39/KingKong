@@ -1,166 +1,150 @@
+using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using UnityEngine;
 using UnityEngine.UI;
-using UnityEngine.EventSystems;
 using UnityEngine.InputSystem;
-using UnityEngine.InputSystem.UI;
 using TMPro;
+using Newtonsoft.Json.Linq;
 
 /// <summary>
-/// GameUI - generates the whole connection + chat UI in code.
-/// No scene setup required: press Play and the UI appears.
+/// GameUI - the in-arena HUD + chat, built in code. Shows health/shield,
+/// ammo, the four ability cooldowns + ultimate charge, a live scoreboard
+/// (hold Tab), a kill feed, crosshair and death overlay. Only visible while
+/// in a match; the menu flow lives in MenuUI.
 /// </summary>
 public class GameUI : MonoBehaviour
 {
-    // Built programmatically
-    TMP_Text statusText;
-    GameObject loginPanel;
-    TMP_InputField nameInput;
+    TMP_Text statusText, ammoText, matchTimerText, killFeedText, scoreboardText, heroText;
+    GameObject hpBar, scoreboardPanel, deathOverlay;
+    Image hpFill, shieldFill;
+    TMP_Text crosshair;
     GameObject chatPanel;
     TMP_Text chatText;
     TMP_InputField chatInput;
     ScrollRect chatScroll;
-    GameObject hpBar;
-    Image hpFill;
-    TMP_Text crosshair;
-    GameObject deathOverlay;
-    TMP_Text deathText;
+
+    // ability cooldown pips
+    readonly string[] slots = { "tactical", "special", "movement", "ultimate" };
+    readonly string[] slotKeys = { "F", "E", "Shift", "Q" };
+    readonly Dictionary<string, float> cooldownEnd = new Dictionary<string, float>();
+    readonly Dictionary<string, Image> slotFill = new Dictionary<string, Image>();
+    readonly Dictionary<string, TMP_Text> slotLabel = new Dictionary<string, TMP_Text>();
 
     readonly StringBuilder chatLog = new StringBuilder();
-    int lineCount = 0;
+    int chatLines;
     const int MaxChatLines = 100;
 
-    TMP_Text chatToggleLabel;
-    /// <summary>True while the chat input field has keyboard focus (blocks game input).</summary>
+    readonly List<(string text, float expire)> killFeed = new List<(string, float)>();
+    JArray lastSnapshot;
+
     public static bool ChatFocused { get; private set; }
 
-    static TMP_FontAsset cachedFont;
+    /// <summary>Backward-compatible font accessor (RemotePlayerManager uses this).</summary>
+    public static TMP_FontAsset GetFont() => UiKit.GetFont();
 
-    /// <summary>
-    /// TMP renders nothing without a font asset. Fresh projects often lack
-    /// "TMP Essentials", so fall back to a dynamic asset from the built-in font.
-    /// Shared with RemotePlayerManager for world-space name tags.
-    /// </summary>
-    public static TMP_FontAsset GetFont()
-    {
-        if (cachedFont != null) return cachedFont;
-
-        cachedFont = TMP_Settings.defaultFontAsset;
-        if (cachedFont == null)
-        {
-            var font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
-            if (font == null)
-                font = Resources.GetBuiltinResource<Font>("Arial.ttf");
-            if (font != null)
-                cachedFont = TMP_FontAsset.CreateFontAsset(font);
-        }
-        return cachedFont;
-    }
-
-    void Awake()
-    {
-        BuildUI();
-    }
+    void Awake() => BuildHud();
 
     void Start()
     {
         var net = GameNetwork.Instance;
-        if (net == null)
-        {
-            Debug.LogError("GameUI: no GameNetwork found");
-            enabled = false;
-            return;
-        }
+        if (net == null) { enabled = false; return; }
 
-        net.OnConnected += () => SetStatus("Connected - awaiting login", Color.yellow);
-        net.OnDisconnected += () =>
+        net.OnNotify += msg => SetStatus(msg);
+        net.OnChatMessage += (from, name, team, text) => AppendLine($"<b>{name}</b>: {text}");
+        net.OnPlayerKilled += (killer, victim) => AddKill($"{killer} ☠ {victim}");
+        net.OnMatchStart += _ =>
         {
-            SetStatus("Disconnected", Color.red);
-            loginPanel.SetActive(true);
-            chatPanel.SetActive(false);
+            cooldownEnd.Clear();
+            AddKill("<color=#9cf>Match started - fight!</color>");
         };
-        net.OnLoggedIn += () =>
-        {
-            SetStatus($"Online - {net.displayName} ({net.playerId}) [{net.team}]", Color.green);
-            loginPanel.SetActive(false);
-            chatPanel.SetActive(true);
-            AppendSystem($"Joined team '{net.team}' - {net.loyaltyPoints} LP, {net.coins} coins");
-            GameClientBootstrap.SpawnPlayer(net.spawnPosition);
-        };
-        net.OnChatMessage += (from, name, team, text) =>
-            AppendLine($"<b>{name}</b>: {text}");
-        net.OnNotify += msg =>
-        {
-            SetStatus(msg, Color.yellow);
-            AppendSystem(msg);
-        };
-        net.OnRawMessage += json =>
-            AppendSystem($"[{string.Join(", ", json.Properties().Select(p => p.Name))}]");
-        net.OnPlayerKilled += (killer, victim) =>
-            AppendSystem($"{killer} eliminated {victim}");
-        net.OnDied += _ => SetStatus("You were eliminated", Color.red);
-        net.OnRespawned += _ => SetStatus($"Online - {net.displayName} ({net.playerId}) [{net.team}]", Color.green);
-
-        nameInput.text = PlayerPrefs.GetString("kk_displayName", "");
+        net.OnWorldState += snap => lastSnapshot = snap;
+        net.OnCooldownState += (slot, cd, ult) => { if (cd > 0) cooldownEnd[slot] = Time.time + cd / 1000f; };
+        net.OnMatchEnd += _ => { };
     }
 
     void Update()
     {
         var kb = Keyboard.current;
         if (kb == null) return;
+        var net = GameNetwork.Instance;
+        bool inMatch = net != null && net.inMatch;
 
         ChatFocused = chatInput != null && chatInput.isFocused;
 
-        // C toggles chat visibility (unless typing)
-        if (!ChatFocused && kb.cKey.wasPressedThisFrame)
-            ToggleChat();
+        // Chat: Enter to focus, C to toggle
+        if (!ChatFocused && kb.cKey.wasPressedThisFrame && inMatch) ToggleChat();
+        if (!ChatFocused && kb.enterKey.wasPressedThisFrame && inMatch && chatPanel.activeSelf)
+        { chatInput.Select(); chatInput.ActivateInputField(); }
 
-        // Enter focuses the chat box (MMO-style)
-        if (!ChatFocused && kb.enterKey.wasPressedThisFrame
-            && chatPanel.activeSelf && GameNetwork.Instance != null && GameNetwork.Instance.IsLoggedIn)
+        hpBar.SetActive(inMatch);
+        ammoText.gameObject.SetActive(inMatch);
+        heroText.gameObject.SetActive(inMatch);
+        matchTimerText.gameObject.SetActive(inMatch);
+        foreach (var img in slotFill.Values) img.transform.parent.gameObject.SetActive(inMatch);
+        crosshair.gameObject.SetActive(inMatch && net.alive && Cursor.lockState == CursorLockMode.Locked);
+        deathOverlay.SetActive(inMatch && !net.alive);
+        if (!inMatch) { scoreboardPanel.SetActive(false); if (chatPanel.activeSelf) chatPanel.SetActive(false); }
+
+        if (!inMatch) { PruneKillFeed(); return; }
+
+        // Health + shield
+        hpFill.fillAmount = Mathf.Clamp01(net.hp / (float)Mathf.Max(1, net.maxHp));
+        hpFill.color = Color.Lerp(Color.red, Color.green, hpFill.fillAmount);
+        shieldFill.fillAmount = Mathf.Clamp01(net.shield / 100f);
+        shieldFill.gameObject.SetActive(net.shield > 0);
+
+        // Ammo + hero
+        ammoText.text = net.reloading ? "<color=#f80>RELOADING</color>" : $"AMMO {net.ammo}";
+        var hero = HeroCatalog.Get(net.hero);
+        heroText.text = hero != null ? $"<b>{hero.name}</b>  <size=22>[{hero.passiveName}]</size>" : "";
+        heroText.color = hero != null ? hero.Color : Color.white;
+
+        // Ability cooldown pips
+        for (int i = 0; i < slots.Length; i++)
         {
-            chatInput.Select();
-            chatInput.ActivateInputField();
+            var slot = slots[i];
+            if (slot == "ultimate")
+            {
+                float frac = Mathf.Clamp01(net.ultCharge / 100f);
+                slotFill[slot].fillAmount = frac;
+                slotFill[slot].color = frac >= 1f ? new Color(1f, 0.85f, 0.2f) : new Color(0.5f, 0.45f, 0.1f);
+                slotLabel[slot].text = frac >= 1f ? "Q\n<size=16>READY</size>" : $"Q\n<size=16>{Mathf.FloorToInt(frac * 100)}%</size>";
+            }
+            else
+            {
+                float remain = cooldownEnd.TryGetValue(slot, out var end) ? Mathf.Max(0, end - Time.time) : 0;
+                slotFill[slot].fillAmount = remain > 0 ? 0.25f : 1f;
+                slotFill[slot].color = remain > 0 ? new Color(0.3f, 0.3f, 0.35f) : new Color(0.25f, 0.5f, 0.8f);
+                slotLabel[slot].text = remain > 0 ? $"{slotKeys[i]}\n<size=16>{remain:0.0}s</size>" : slotKeys[i];
+            }
         }
 
-        // HUD: health bar, crosshair, death overlay
-        var net = GameNetwork.Instance;
-        if (net != null && net.IsLoggedIn)
+        // Match timer (from latest WORLD_STATE)
+        if (net.timeLeftMs > 0)
         {
-            hpFill.fillAmount = net.hp / 100f;
-            hpFill.color = Color.Lerp(Color.red, Color.green, net.hp / 100f);
-            hpBar.SetActive(true);
-            crosshair.gameObject.SetActive(net.alive && Cursor.lockState == CursorLockMode.Locked);
-            deathOverlay.SetActive(!net.alive);
+            int s = net.timeLeftMs / 1000;
+            matchTimerText.text = $"{s / 60}:{s % 60:00}";
         }
-        else
-        {
-            hpBar.SetActive(false);
-            crosshair.gameObject.SetActive(false);
-            deathOverlay.SetActive(false);
-        }
+        else matchTimerText.text = "";
+
+        // Scoreboard (hold Tab)
+        bool showSb = kb.tabKey.isPressed;
+        scoreboardPanel.SetActive(showSb);
+        if (showSb) RebuildScoreboard();
+
+        PruneKillFeed();
     }
 
-    /// <summary>Show/hide the chat panel. Also bound to the C key and the CHAT button.</summary>
+    // ==========================================================
+    // Chat
+    // ==========================================================
+
     public void ToggleChat()
     {
         var net = GameNetwork.Instance;
-        if (net == null || !net.IsLoggedIn) return;
-
-        bool show = !chatPanel.activeSelf;
-        chatPanel.SetActive(show);
-        if (chatToggleLabel != null)
-            chatToggleLabel.text = show ? "HIDE CHAT" : "SHOW CHAT";
-    }
-
-    // ==========================================================
-    // UI callbacks
-    // ==========================================================
-
-    void OnConnectClicked()
-    {
-        GameNetwork.Instance.Login(nameInput.text);
+        if (net == null || !net.inMatch) return;
+        chatPanel.SetActive(!chatPanel.activeSelf);
     }
 
     void OnSendClicked()
@@ -172,359 +156,226 @@ public class GameUI : MonoBehaviour
         chatInput.ActivateInputField();
     }
 
-    void SetStatus(string msg, Color color)
-    {
-        statusText.text = msg;
-        statusText.color = color;
-    }
-
-    void AppendSystem(string line) => AppendLine($"<i><color=#888888>{line}</color></i>");
-
     void AppendLine(string line)
     {
         chatLog.AppendLine(line);
-        lineCount++;
-
-        if (lineCount > MaxChatLines)
+        chatLines++;
+        if (chatLines > MaxChatLines)
         {
             var s = chatLog.ToString();
-            var firstNewline = s.IndexOf('\n');
-            if (firstNewline >= 0)
-            {
-                chatLog.Remove(0, firstNewline + 1);
-                lineCount--;
-            }
+            var nl = s.IndexOf('\n');
+            if (nl >= 0) { chatLog.Remove(0, nl + 1); chatLines--; }
         }
-
         chatText.text = chatLog.ToString();
         Canvas.ForceUpdateCanvases();
-        chatScroll.verticalNormalizedPosition = 0f;
+        if (chatScroll != null) chatScroll.verticalNormalizedPosition = 0f;
     }
 
     // ==========================================================
-    // Programmatic UI construction
+    // Kill feed + scoreboard
     // ==========================================================
 
-    void BuildUI()
+    void AddKill(string line)
     {
-        EnsureEventSystem();
+        killFeed.Add((line, Time.time + 6f));
+        if (killFeed.Count > 6) killFeed.RemoveAt(0);
+        RenderKillFeed();
+    }
 
-        // Canvas
-        var canvasGo = new GameObject("GameCanvas",
-            typeof(RectTransform), typeof(Canvas), typeof(CanvasScaler), typeof(GraphicRaycaster));
-        canvasGo.transform.SetParent(transform, false);
-        var canvas = canvasGo.GetComponent<Canvas>();
-        canvas.renderMode = RenderMode.ScreenSpaceOverlay;
-        var scaler = canvasGo.GetComponent<CanvasScaler>();
-        scaler.uiScaleMode = CanvasScaler.ScaleMode.ScaleWithScreenSize;
-        scaler.referenceResolution = new Vector2(1280, 720);
+    void PruneKillFeed()
+    {
+        int before = killFeed.Count;
+        killFeed.RemoveAll(k => Time.time > k.expire);
+        if (killFeed.Count != before) RenderKillFeed();
+    }
 
-        // --- Status bar (top strip) ---
-        statusText = MakeText(canvasGo.transform, "StatusText", "Connecting...",
-            42, TextAlignmentOptions.Center, Color.yellow);
-        Anchor(statusText.rectTransform, 0, 1, 1, 1, new Vector2(10, -96), new Vector2(-10, -10));
+    void RenderKillFeed() => killFeedText.text = string.Join("\n", killFeed.Select(k => k.text));
 
-        // --- Chat toggle button (top-right) ---
-        var chatToggle = MakeButton(canvasGo.transform, "ChatToggle", "HIDE CHAT");
-        var ctRt = chatToggle.GetComponent<RectTransform>();
-        ctRt.anchorMin = new Vector2(1, 1);
-        ctRt.anchorMax = new Vector2(1, 1);
-        ctRt.pivot = new Vector2(1, 1);
-        ctRt.offsetMin = new Vector2(-240, -100);
-        ctRt.offsetMax = new Vector2(-14, -10);
-        chatToggleLabel = chatToggle.GetComponentInChildren<TMP_Text>();
-        chatToggle.onClick.AddListener(ToggleChat);
+    void RebuildScoreboard()
+    {
+        if (lastSnapshot == null) { scoreboardText.text = "..."; return; }
+        var rows = lastSnapshot
+            .Select(p => new {
+                name = p["displayName"]?.ToString() ?? "?",
+                hero = p["hero"]?.ToString() ?? "",
+                team = p["team"]?.ToString() ?? "",
+                kills = p["score"]?.ToObject<int>() ?? 0,
+                deaths = p["deaths"]?.ToObject<int>() ?? 0,
+                bot = p["isBot"]?.ToObject<bool>() ?? false
+            })
+            .OrderByDescending(r => r.kills)
+            .ToList();
 
-        // --- Login panel (center) ---
-        loginPanel = MakePanel(canvasGo.transform, "LoginPanel",
-            new Vector2(0.5f, 0.5f), new Vector2(0.5f, 0.5f), new Vector2(0.5f, 0.5f),
-            new Vector2(720, 360), new Color(0.1f, 0.1f, 0.12f, 0.9f));
+        var sb = new StringBuilder();
+        sb.AppendLine("<b>SCOREBOARD</b>  <size=18>(hold Tab)</size>");
+        sb.AppendLine("<size=20>Player               Hero           K / D</size>");
+        foreach (var r in rows)
+        {
+            var h = HeroCatalog.Get(r.hero);
+            string hc = h != null ? ColorUtility.ToHtmlStringRGB(h.Color) : "FFFFFF";
+            string name = r.bot ? $"<i>{r.name}</i>" : r.name;
+            sb.AppendLine($"{name,-20} <color=#{hc}>{(h != null ? h.name : r.hero),-13}</color> {r.kills} / {r.deaths}");
+        }
+        scoreboardText.text = sb.ToString();
+    }
 
-        var title = MakeText(loginPanel.transform, "Title", "KINGKONG",
-            56, TextAlignmentOptions.Center, Color.white);
-        Anchor(title.rectTransform, 0, 1, 1, 1, new Vector2(0, -90), new Vector2(0, -18));
+    void SetStatus(string msg) { if (statusText != null) statusText.text = msg; }
 
-        nameInput = MakeInput(loginPanel.transform, "NameInput", "display name");
-        Anchor(nameInput.GetComponent<RectTransform>(), 0, 1, 1, 1,
-            new Vector2(30, -178), new Vector2(-30, -100));
+    // ==========================================================
+    // HUD construction
+    // ==========================================================
 
-        var connectBtn = MakeButton(loginPanel.transform, "ConnectButton", "CONNECT");
-        Anchor(connectBtn.GetComponent<RectTransform>(), 0, 1, 1, 1,
-            new Vector2(30, -278), new Vector2(-30, -196));
-        connectBtn.onClick.AddListener(OnConnectClicked);
-        nameInput.onSubmit.AddListener(_ => OnConnectClicked());
+    void BuildHud()
+    {
+        var canvas = UiKit.MakeCanvas("HudCanvas", 0);
+        var root = canvas.transform;
 
-        // --- Chat panel (bottom half) ---
-        chatPanel = MakePanel(canvasGo.transform, "ChatPanel",
-            new Vector2(0, 0), new Vector2(1, 0), new Vector2(0.5f, 0),
-            new Vector2(-40, 300), new Color(0.08f, 0.08f, 0.1f, 0.85f));
-        var chatPanelRt = chatPanel.GetComponent<RectTransform>();
-        chatPanelRt.offsetMin = new Vector2(24, 24);   // left/bottom margin
-        chatPanelRt.offsetMax = new Vector2(-24, 560);
+        statusText = UiKit.MakeText(root, "Status", "", 26, TextAlignmentOptions.TopLeft, Color.yellow);
+        UiKit.Anchor(statusText.rectTransform, 0, 1, 1, 1, new Vector2(16, -44), new Vector2(-16, -12));
 
-        // Scroll view for chat log
-        var scrollGo = new GameObject("ChatScroll",
-            typeof(RectTransform), typeof(Image), typeof(ScrollRect));
+        heroText = UiKit.MakeText(root, "Hero", "", 26, TextAlignmentOptions.BottomLeft, Color.white);
+        UiKit.Anchor(heroText.rectTransform, 0, 0, 0.6f, 0, new Vector2(24, 150), new Vector2(0, 190));
+
+        matchTimerText = UiKit.MakeText(root, "Timer", "", 34, TextAlignmentOptions.Top, Color.white);
+        UiKit.Anchor(matchTimerText.rectTransform, 0.5f, 1, 0.5f, 1, new Vector2(-120, -70), new Vector2(120, -14));
+
+        killFeedText = UiKit.MakeText(root, "KillFeed", "", 22, TextAlignmentOptions.TopRight, new Color(1, 0.9f, 0.9f));
+        UiKit.Anchor(killFeedText.rectTransform, 0.5f, 1, 1, 1, new Vector2(0, -220), new Vector2(-16, -60));
+
+        // Crosshair
+        crosshair = UiKit.MakeText(root, "Crosshair", "+", 36, TextAlignmentOptions.Center, Color.white);
+        var cr = crosshair.rectTransform;
+        cr.anchorMin = cr.anchorMax = new Vector2(0.5f, 0.5f);
+        cr.sizeDelta = new Vector2(50, 50);
+        cr.anchoredPosition = Vector2.zero;
+        crosshair.gameObject.SetActive(false);
+
+        // Health + shield bar
+        hpBar = UiKit.MakePanel(root, "HPBar", new Vector2(0.5f, 0), new Vector2(0.5f, 0),
+            new Vector2(0.5f, 0), new Vector2(460, 34), new Color(0.08f, 0.08f, 0.08f, 0.9f));
+        hpBar.GetComponent<RectTransform>().anchoredPosition = new Vector2(0, 54);
+        hpFill = MakeBarFill(hpBar.transform, Color.green);
+        shieldFill = MakeBarFill(hpBar.transform, new Color(0.5f, 0.8f, 1f, 0.9f));
+        shieldFill.gameObject.SetActive(false);
+
+        ammoText = UiKit.MakeText(root, "Ammo", "", 30, TextAlignmentOptions.BottomRight, Color.white);
+        UiKit.Anchor(ammoText.rectTransform, 1, 0, 1, 0, new Vector2(-240, 54), new Vector2(-24, 100));
+
+        BuildAbilityPips(root);
+        BuildScoreboard(root);
+        BuildDeathOverlay(root);
+        BuildChat(root);
+    }
+
+    Image MakeBarFill(Transform parent, Color color)
+    {
+        var go = new GameObject("Fill", typeof(RectTransform), typeof(Image));
+        go.transform.SetParent(parent, false);
+        UiKit.Fill(go.GetComponent<RectTransform>());
+        var rt = go.GetComponent<RectTransform>();
+        rt.offsetMin = new Vector2(4, 4); rt.offsetMax = new Vector2(-4, -4);
+        var img = go.GetComponent<Image>();
+        img.color = color;
+        img.type = Image.Type.Filled;
+        img.fillMethod = Image.FillMethod.Horizontal;
+        img.fillOrigin = (int)Image.OriginHorizontal.Left;
+        return img;
+    }
+
+    void BuildAbilityPips(Transform root)
+    {
+        float size = 72, gap = 12;
+        float totalW = slots.Length * size + (slots.Length - 1) * gap;
+        for (int i = 0; i < slots.Length; i++)
+        {
+            var pip = UiKit.MakePanel(root, "Pip_" + slots[i], new Vector2(0.5f, 0), new Vector2(0.5f, 0),
+                new Vector2(0.5f, 0), new Vector2(size, size), new Color(0.1f, 0.1f, 0.12f, 0.9f));
+            var rt = pip.GetComponent<RectTransform>();
+            rt.anchoredPosition = new Vector2(-totalW / 2 + size / 2 + i * (size + gap), 110);
+
+            var fill = new GameObject("Fill", typeof(RectTransform), typeof(Image));
+            fill.transform.SetParent(pip.transform, false);
+            UiKit.Fill(fill.GetComponent<RectTransform>());
+            var img = fill.GetComponent<Image>();
+            img.color = new Color(0.25f, 0.5f, 0.8f);
+            img.type = Image.Type.Filled;
+            img.fillMethod = Image.FillMethod.Vertical;
+            img.fillOrigin = (int)Image.OriginVertical.Bottom;
+            slotFill[slots[i]] = img;
+
+            var label = UiKit.MakeText(pip.transform, "Key", slotKeys[i], 26, TextAlignmentOptions.Center, Color.white);
+            UiKit.Fill(label.rectTransform);
+            slotLabel[slots[i]] = label;
+        }
+    }
+
+    void BuildScoreboard(Transform root)
+    {
+        scoreboardPanel = UiKit.MakePanel(root, "Scoreboard", new Vector2(0.5f, 0.5f), new Vector2(0.5f, 0.5f),
+            new Vector2(0.5f, 0.5f), new Vector2(760, 440), new Color(0.05f, 0.05f, 0.08f, 0.94f));
+        scoreboardText = UiKit.MakeText(scoreboardPanel.transform, "SbText", "", 22, TextAlignmentOptions.TopLeft, Color.white);
+        var rt = scoreboardText.rectTransform;
+        UiKit.Fill(rt);
+        rt.offsetMin = new Vector2(24, 20); rt.offsetMax = new Vector2(-24, -20);
+        scoreboardPanel.SetActive(false);
+    }
+
+    void BuildDeathOverlay(Transform root)
+    {
+        deathOverlay = new GameObject("DeathOverlay", typeof(RectTransform), typeof(Image));
+        deathOverlay.transform.SetParent(root, false);
+        UiKit.Fill(deathOverlay.GetComponent<RectTransform>());
+        deathOverlay.GetComponent<Image>().color = new Color(0.5f, 0, 0, 0.45f);
+        var t = UiKit.MakeText(deathOverlay.transform, "DeathText",
+            "YOU DIED\n<size=36>respawning...</size>", 72, TextAlignmentOptions.Center, Color.white);
+        UiKit.Fill(t.rectTransform);
+        deathOverlay.SetActive(false);
+    }
+
+    void BuildChat(Transform root)
+    {
+        chatPanel = UiKit.MakePanel(root, "ChatPanel", new Vector2(0, 0), new Vector2(0.4f, 0),
+            new Vector2(0, 0), new Vector2(0, 260), new Color(0.08f, 0.08f, 0.1f, 0.8f));
+        var cp = chatPanel.GetComponent<RectTransform>();
+        cp.offsetMin = new Vector2(20, 200); cp.offsetMax = new Vector2(520, 460);
+
+        var scrollGo = new GameObject("ChatScroll", typeof(RectTransform), typeof(Image), typeof(ScrollRect));
         scrollGo.transform.SetParent(chatPanel.transform, false);
-        scrollGo.GetComponent<Image>().color = new Color(0.05f, 0.05f, 0.07f, 1f);
-        var scrollRt = scrollGo.GetComponent<RectTransform>();
-        scrollRt.anchorMin = new Vector2(0, 0);
-        scrollRt.anchorMax = new Vector2(1, 1);
-        scrollRt.offsetMin = new Vector2(10, 88);   // leave room for input row
-        scrollRt.offsetMax = new Vector2(-10, -10);
+        scrollGo.GetComponent<Image>().color = new Color(0.05f, 0.05f, 0.07f, 0.8f);
+        var srt = scrollGo.GetComponent<RectTransform>();
+        UiKit.Fill(srt); srt.offsetMin = new Vector2(8, 60); srt.offsetMax = new Vector2(-8, -8);
 
         var viewport = new GameObject("Viewport", typeof(RectTransform), typeof(RectMask2D));
         viewport.transform.SetParent(scrollGo.transform, false);
-        var vpRt = viewport.GetComponent<RectTransform>();
-        vpRt.anchorMin = Vector2.zero;
-        vpRt.anchorMax = Vector2.one;
-        vpRt.offsetMin = Vector2.zero;
-        vpRt.offsetMax = Vector2.zero;
+        UiKit.Fill(viewport.GetComponent<RectTransform>());
 
-        var content = new GameObject("Content", typeof(RectTransform),
-            typeof(VerticalLayoutGroup), typeof(ContentSizeFitter));
+        var content = new GameObject("Content", typeof(RectTransform), typeof(VerticalLayoutGroup), typeof(ContentSizeFitter));
         content.transform.SetParent(viewport.transform, false);
-        var contentRt = content.GetComponent<RectTransform>();
-        contentRt.anchorMin = new Vector2(0, 1);
-        contentRt.anchorMax = new Vector2(1, 1);
-        contentRt.pivot = new Vector2(0.5f, 1);
-        contentRt.offsetMin = new Vector2(4, 0);
-        contentRt.offsetMax = new Vector2(-4, 0);
+        var crt = content.GetComponent<RectTransform>();
+        crt.anchorMin = new Vector2(0, 1); crt.anchorMax = new Vector2(1, 1); crt.pivot = new Vector2(0.5f, 1);
         var vlg = content.GetComponent<VerticalLayoutGroup>();
-        vlg.childForceExpandWidth = true;
-        vlg.childForceExpandHeight = false;
-        vlg.childControlWidth = true;
-        vlg.childControlHeight = true;
-        var fitter = content.GetComponent<ContentSizeFitter>();
-        fitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
+        vlg.childForceExpandWidth = true; vlg.childControlWidth = true; vlg.childControlHeight = true;
+        content.GetComponent<ContentSizeFitter>().verticalFit = ContentSizeFitter.FitMode.PreferredSize;
 
-        chatText = MakeText(content.transform, "ChatText", "", 30,
-            TextAlignmentOptions.TopLeft, Color.white);
-        chatText.rectTransform.anchorMin = new Vector2(0, 0);
-        chatText.rectTransform.anchorMax = new Vector2(1, 1);
-        chatText.rectTransform.offsetMin = Vector2.zero;
-        chatText.rectTransform.offsetMax = Vector2.zero;
+        chatText = UiKit.MakeText(content.transform, "ChatText", "", 22, TextAlignmentOptions.TopLeft, Color.white);
+        UiKit.Fill(chatText.rectTransform);
 
         chatScroll = scrollGo.GetComponent<ScrollRect>();
-        chatScroll.viewport = vpRt;
-        chatScroll.content = contentRt;
-        chatScroll.horizontal = false;
-        chatScroll.vertical = true;
+        chatScroll.viewport = viewport.GetComponent<RectTransform>();
+        chatScroll.content = crt; chatScroll.horizontal = false; chatScroll.vertical = true;
 
-        // Input row: chat input + send button
-        chatInput = MakeInput(chatPanel.transform, "ChatInput", "type a message...");
-        var ciRt = chatInput.GetComponent<RectTransform>();
-        ciRt.anchorMin = new Vector2(0, 0);
-        ciRt.anchorMax = new Vector2(1, 0);
-        ciRt.pivot = new Vector2(0, 0);
-        ciRt.offsetMin = new Vector2(12, 12);
-        ciRt.offsetMax = new Vector2(-200, 76);
+        chatInput = UiKit.MakeInput(chatPanel.transform, "ChatInput", "type a message...");
+        var ci = chatInput.GetComponent<RectTransform>();
+        ci.anchorMin = new Vector2(0, 0); ci.anchorMax = new Vector2(1, 0); ci.pivot = new Vector2(0, 0);
+        ci.offsetMin = new Vector2(8, 8); ci.offsetMax = new Vector2(-96, 52);
         chatInput.onSubmit.AddListener(_ => OnSendClicked());
 
-        var sendBtn = MakeButton(chatPanel.transform, "SendButton", "SEND");
-        var sbRt = sendBtn.GetComponent<RectTransform>();
-        sbRt.anchorMin = new Vector2(1, 0);
-        sbRt.anchorMax = new Vector2(1, 0);
-        sbRt.pivot = new Vector2(1, 0);
-        sbRt.offsetMin = new Vector2(-188, 12);
-        sbRt.offsetMax = new Vector2(-12, 76);
-        sendBtn.onClick.AddListener(OnSendClicked);
-
-        // --- Crosshair (screen center) ---
-        crosshair = MakeText(canvasGo.transform, "Crosshair", "+",
-            36, TextAlignmentOptions.Center, Color.white);
-        var crossRt = crosshair.rectTransform;
-        crossRt.anchorMin = new Vector2(0.5f, 0.5f);
-        crossRt.anchorMax = new Vector2(0.5f, 0.5f);
-        crossRt.sizeDelta = new Vector2(50, 50);
-        crossRt.anchoredPosition = Vector2.zero;
-        crosshair.gameObject.SetActive(false);
-
-        // --- Health bar (bottom center, above chat) ---
-        hpBar = MakePanel(canvasGo.transform, "HPBar",
-            new Vector2(0.5f, 0), new Vector2(0.5f, 0), new Vector2(0.5f, 0),
-            new Vector2(440, 40), new Color(0.08f, 0.08f, 0.08f, 0.9f));
-        hpBar.GetComponent<RectTransform>().anchoredPosition = new Vector2(0, 585);
-
-        var fillGo = new GameObject("Fill", typeof(RectTransform), typeof(Image));
-        fillGo.transform.SetParent(hpBar.transform, false);
-        var fillRt = fillGo.GetComponent<RectTransform>();
-        fillRt.anchorMin = Vector2.zero;
-        fillRt.anchorMax = Vector2.one;
-        fillRt.offsetMin = new Vector2(4, 4);
-        fillRt.offsetMax = new Vector2(-4, -4);
-        hpFill = fillGo.GetComponent<Image>();
-        hpFill.color = Color.green;
-        hpFill.type = Image.Type.Filled;
-        hpFill.fillMethod = Image.FillMethod.Horizontal;
-        hpFill.fillOrigin = (int)Image.OriginHorizontal.Left;
-        hpBar.SetActive(false);
-
-        // --- Death overlay ---
-        deathOverlay = new GameObject("DeathOverlay", typeof(RectTransform), typeof(Image));
-        deathOverlay.transform.SetParent(canvasGo.transform, false);
-        var doRt = deathOverlay.GetComponent<RectTransform>();
-        doRt.anchorMin = Vector2.zero;
-        doRt.anchorMax = Vector2.one;
-        doRt.offsetMin = Vector2.zero;
-        doRt.offsetMax = Vector2.zero;
-        deathOverlay.GetComponent<Image>().color = new Color(0.5f, 0, 0, 0.45f);
-
-        deathText = MakeText(deathOverlay.transform, "DeathText",
-            "YOU DIED\n<size=40>respawning...</size>",
-            72, TextAlignmentOptions.Center, Color.white);
-        var dtRt = deathText.rectTransform;
-        dtRt.anchorMin = Vector2.zero;
-        dtRt.anchorMax = Vector2.one;
-        dtRt.offsetMin = Vector2.zero;
-        dtRt.offsetMax = Vector2.zero;
-        deathOverlay.SetActive(false);
+        var send = UiKit.MakeButton(chatPanel.transform, "Send", "SEND");
+        var sb = send.GetComponent<RectTransform>();
+        sb.anchorMin = new Vector2(1, 0); sb.anchorMax = new Vector2(1, 0); sb.pivot = new Vector2(1, 0);
+        sb.offsetMin = new Vector2(-88, 8); sb.offsetMax = new Vector2(-8, 52);
+        send.onClick.AddListener(OnSendClicked);
 
         chatPanel.SetActive(false);
-    }
-
-    void EnsureEventSystem()
-    {
-        if (FindFirstObjectByType<EventSystem>() != null) return;
-        var es = new GameObject("EventSystem", typeof(EventSystem), typeof(InputSystemUIInputModule));
-        es.transform.SetParent(transform, false);
-    }
-
-    // ---------- widget factories ----------
-
-    static GameObject MakePanel(Transform parent, string name,
-        Vector2 anchorMin, Vector2 anchorMax, Vector2 pivot,
-        Vector2 size, Color color)
-    {
-        var go = new GameObject(name, typeof(RectTransform), typeof(Image));
-        go.transform.SetParent(parent, false);
-        var rt = go.GetComponent<RectTransform>();
-        rt.anchorMin = anchorMin;
-        rt.anchorMax = anchorMax;
-        rt.pivot = pivot;
-        rt.sizeDelta = size;
-        rt.anchoredPosition = Vector2.zero;
-        go.GetComponent<Image>().color = color;
-        return go;
-    }
-
-    static TMP_Text MakeText(Transform parent, string name, string content,
-        int fontSize, TextAlignmentOptions align, Color color)
-    {
-        var go = new GameObject(name, typeof(RectTransform), typeof(TextMeshProUGUI));
-        go.transform.SetParent(parent, false);
-        var t = go.GetComponent<TextMeshProUGUI>();
-        if (GetFont() != null) t.font = GetFont();
-        t.text = content;
-        t.fontSize = fontSize;
-        t.alignment = align;
-        t.color = color;
-        t.richText = true;
-        return t;
-    }
-
-    static TMP_InputField MakeInput(Transform parent, string name, string placeholder)
-    {
-        var go = new GameObject(name, typeof(RectTransform), typeof(Image), typeof(TMP_InputField));
-        go.transform.SetParent(parent, false);
-        go.GetComponent<Image>().color = new Color(0.16f, 0.16f, 0.2f, 1f);
-
-        var textArea = new GameObject("TextArea", typeof(RectTransform), typeof(RectMask2D));
-        textArea.transform.SetParent(go.transform, false);
-        var taRt = textArea.GetComponent<RectTransform>();
-        taRt.anchorMin = Vector2.zero;
-        taRt.anchorMax = Vector2.one;
-        taRt.offsetMin = new Vector2(8, 2);
-        taRt.offsetMax = new Vector2(-8, -2);
-
-        var ph = MakeText(textArea.transform, "Placeholder", placeholder,
-            30, TextAlignmentOptions.MidlineLeft, new Color(1, 1, 1, 0.4f));
-        ph.fontStyle = FontStyles.Italic;
-        ph.rectTransform.anchorMin = Vector2.zero;
-        ph.rectTransform.anchorMax = Vector2.one;
-        ph.rectTransform.offsetMin = Vector2.zero;
-        ph.rectTransform.offsetMax = Vector2.zero;
-
-        var txt = MakeText(textArea.transform, "Text", "",
-            30, TextAlignmentOptions.MidlineLeft, Color.white);
-        txt.rectTransform.anchorMin = Vector2.zero;
-        txt.rectTransform.anchorMax = Vector2.one;
-        txt.rectTransform.offsetMin = Vector2.zero;
-        txt.rectTransform.offsetMax = Vector2.zero;
-
-        var input = go.GetComponent<TMP_InputField>();
-        input.textViewport = taRt;
-        input.textComponent = txt;
-        input.placeholder = ph;
-        return input;
-    }
-
-    static Button MakeButton(Transform parent, string name, string label)
-    {
-        var go = new GameObject(name, typeof(RectTransform), typeof(Image), typeof(Button));
-        go.transform.SetParent(parent, false);
-        go.GetComponent<Image>().color = new Color(0.2f, 0.45f, 0.75f, 1f);
-
-        var txt = MakeText(go.transform, "Label", label,
-            32, TextAlignmentOptions.Center, Color.white);
-        txt.rectTransform.anchorMin = Vector2.zero;
-        txt.rectTransform.anchorMax = Vector2.one;
-        txt.rectTransform.offsetMin = Vector2.zero;
-        txt.rectTransform.offsetMax = Vector2.zero;
-        return go.GetComponent<Button>();
-    }
-
-    // ---------- helpers ----------
-
-    static void Anchor(RectTransform rt,
-        float minX, float minY, float maxX, float maxY,
-        Vector2 offsetMin, Vector2 offsetMax)
-    {
-        rt.anchorMin = new Vector2(minX, minY);
-        rt.anchorMax = new Vector2(maxX, maxY);
-        rt.offsetMin = offsetMin;
-        rt.offsetMax = offsetMax;
-    }
-}
-
-/// <summary>
-/// Auto-bootstrap: spawns the world and client (network + UI) on Play,
-/// so nothing needs to be placed in a scene manually. The controllable
-/// player object is spawned on successful login via SpawnPlayer().
-/// </summary>
-public static class GameClientBootstrap
-{
-    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
-    static void Boot()
-    {
-        // Generated test world
-        if (Object.FindFirstObjectByType<WorldGenerator>() == null)
-            new GameObject("World").AddComponent<WorldGenerator>();
-
-        // Network + generated UI + remote player rendering
-        if (Object.FindFirstObjectByType<GameNetwork>() == null)
-        {
-            var go = new GameObject("KingKongClient");
-            go.AddComponent<GameNetwork>();
-            go.AddComponent<GameUI>();
-            go.AddComponent<RemotePlayerManager>();
-        }
-    }
-
-    /// <summary>
-    /// Create the first-person player object (called after login).
-    /// Safe to call multiple times - only spawns once.
-    /// </summary>
-    public static FirstPersonController SpawnPlayer(Vector3 position = default)
-    {
-        var existing = Object.FindFirstObjectByType<FirstPersonController>();
-        if (existing != null) return existing;
-
-        if (position == default) position = new Vector3(0, 0.1f, 0);
-
-        var player = new GameObject("Player");
-        player.transform.position = position;
-        player.AddComponent<CharacterController>();
-        return player.AddComponent<FirstPersonController>();
     }
 }

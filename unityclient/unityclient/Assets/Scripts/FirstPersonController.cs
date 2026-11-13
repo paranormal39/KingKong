@@ -2,41 +2,50 @@ using UnityEngine;
 using UnityEngine.InputSystem;
 
 /// <summary>
-/// FirstPersonController - WASD + mouse look + jump, built on
-/// CharacterController and the new Input System.
+/// FirstPersonController - full arena control kit on CharacterController + the
+/// new Input System. The server is authoritative for damage / cooldowns / HP;
+/// this just reports inputs and plays local feedback.
 ///
-/// Controls:
-///   WASD  - move          Mouse - look
-///   Space - jump          Esc   - release/capture cursor
+///   WASD  move            Mouse look           Space jump
+///   LMB   primary fire    RMB   secondary/ADS  R     reload
+///   F     tactical        E     special        Shift movement (dash)
+///   Q     ultimate        V     melee          Ctrl  crouch / slide
+///   1 / 2 weapon switch   Esc   release cursor
 ///
-/// Input is ignored while the cursor is unlocked or the chat box is focused,
-/// so typing in chat never moves the player.
+/// Input is ignored while the cursor is unlocked or chat is focused.
 /// </summary>
 [RequireComponent(typeof(CharacterController))]
 public class FirstPersonController : MonoBehaviour
 {
     public float moveSpeed = 7f;
-    public float lookSensitivity = 0.08f; // degrees per pixel of mouse delta
+    public float crouchSpeed = 3.5f;
+    public float lookSensitivity = 0.08f;
     public float jumpHeight = 1.4f;
     public float gravity = -19.6f;
     public Transform cameraTransform;
 
-    public float fireInterval = 0.3f; // matches server FIRE_INTERVAL_MS
-    public float shootRange = 60f;    // matches server SHOT_RANGE
+    public float primaryInterval = 0.12f;   // client send cadence (server enforces real rate)
+    public float secondaryInterval = 0.5f;
+    public float shootRange = 85f;
 
     CharacterController cc;
-    float pitch;
-    float velocityY;
-    bool isDead;
-    float lastShotAt;
+    float pitch, velocityY;
+    bool isDead, crouching;
+    float lastPrimary, lastSecondary, lastMelee;
 
-    // Position reporting to the server (10 Hz while moving, 0.5 Hz keepalive)
-    float sendTimer;
-    float keepaliveTimer;
+    // movement-ability dash impulse
+    float dashUntil;
+    Vector3 dashDir;
+    const float DashDuration = 0.15f;
+    const float DashSpeed = 48f;
+
+    float baseFov = 75f, adsFov = 55f;
+
+    // position reporting
+    float sendTimer, keepaliveTimer;
     Vector3 lastSentPos;
-    const float SendInterval = 0.1f;
-    const float KeepaliveInterval = 2f;
-    const float MinMoveDelta = 0.01f;
+    bool lastSentCrouch;
+    const float SendInterval = 0.1f, KeepaliveInterval = 2f, MinMoveDelta = 0.01f;
 
     void Start()
     {
@@ -50,25 +59,19 @@ public class FirstPersonController : MonoBehaviour
             camGo.transform.SetParent(transform, false);
             camGo.transform.localPosition = new Vector3(0, 1.65f, 0);
             var cam = camGo.AddComponent<Camera>();
-            cam.fieldOfView = 75f;
+            cam.fieldOfView = baseFov;
             camGo.tag = "MainCamera";
             camGo.AddComponent<AudioListener>();
             cameraTransform = camGo.transform;
         }
 
-        // Only one camera/audio listener should be active
         foreach (var c in FindObjectsByType<Camera>(FindObjectsSortMode.None))
             if (c.transform != cameraTransform) c.gameObject.SetActive(false);
         foreach (var al in FindObjectsByType<AudioListener>(FindObjectsSortMode.None))
             if (al.transform != cameraTransform) al.enabled = false;
 
-        // Death / respawn wiring (server-authoritative)
         var net = GameNetwork.Instance;
-        if (net != null)
-        {
-            net.OnDied += HandleDied;
-            net.OnRespawned += RespawnAt;
-        }
+        if (net != null) { net.OnDied += HandleDied; net.OnRespawned += RespawnAt; }
 
         LockCursor(true);
     }
@@ -76,17 +79,10 @@ public class FirstPersonController : MonoBehaviour
     void OnDestroy()
     {
         var net = GameNetwork.Instance;
-        if (net != null)
-        {
-            net.OnDied -= HandleDied;
-            net.OnRespawned -= RespawnAt;
-        }
+        if (net != null) { net.OnDied -= HandleDied; net.OnRespawned -= RespawnAt; }
     }
 
-    void HandleDied(string killerName)
-    {
-        isDead = true;
-    }
+    void HandleDied(string killerName) => isDead = true;
 
     void Update()
     {
@@ -94,9 +90,7 @@ public class FirstPersonController : MonoBehaviour
         var mouse = Mouse.current;
         if (kb == null || mouse == null) return;
 
-        // Esc releases the cursor (for UI/chat); click re-captures it
-        if (kb.escapeKey.wasPressedThisFrame)
-            LockCursor(false);
+        if (kb.escapeKey.wasPressedThisFrame) LockCursor(false);
         else if (Cursor.lockState != CursorLockMode.Locked
                  && mouse.leftButton.wasPressedThisFrame
                  && !GameUI.ChatFocused
@@ -105,6 +99,7 @@ public class FirstPersonController : MonoBehaviour
             LockCursor(true);
 
         bool playing = Cursor.lockState == CursorLockMode.Locked && !GameUI.ChatFocused && !isDead;
+        var net = GameNetwork.Instance;
 
         // Look
         if (playing)
@@ -115,18 +110,48 @@ public class FirstPersonController : MonoBehaviour
             cameraTransform.localEulerAngles = new Vector3(pitch, 0, 0);
         }
 
-        // Shoot
-        if (playing && mouse.leftButton.wasPressedThisFrame
-            && Time.time - lastShotAt >= fireInterval)
+        // Aim-down-sights (hold RMB) - FOV only
+        bool ads = playing && mouse.rightButton.isPressed;
+        var cam = cameraTransform.GetComponent<Camera>();
+        if (cam != null) cam.fieldOfView = Mathf.Lerp(cam.fieldOfView, ads ? adsFov : baseFov, 12f * Time.deltaTime);
+
+        if (playing && net != null)
         {
-            lastShotAt = Time.time;
-            Shoot();
+            // Primary fire (LMB)
+            if (mouse.leftButton.isPressed && Time.time - lastPrimary >= primaryInterval)
+            { lastPrimary = Time.time; FireWeapon(false); }
+
+            // Secondary fire (RMB click)
+            if (mouse.rightButton.wasPressedThisFrame && Time.time - lastSecondary >= secondaryInterval)
+            { lastSecondary = Time.time; FireWeapon(true); }
+
+            // Reload / melee / weapon switch
+            if (kb.rKey.wasPressedThisFrame) net.Reload();
+            if (kb.vKey.wasPressedThisFrame && Time.time - lastMelee >= 0.7f) { lastMelee = Time.time; MeleeAttack(); }
+            if (kb.digit1Key.wasPressedThisFrame) net.SwitchWeapon(0);
+            if (kb.digit2Key.wasPressedThisFrame) net.SwitchWeapon(1);
+
+            // Abilities
+            if (kb.fKey.wasPressedThisFrame) net.UseAbility("tactical");
+            if (kb.eKey.wasPressedThisFrame) net.UseAbility("special");
+            if (kb.qKey.wasPressedThisFrame) net.UseAbility("ultimate");
+            if (kb.leftShiftKey.wasPressedThisFrame || kb.rightShiftKey.wasPressedThisFrame)
+            {
+                net.UseAbility("movement");
+                dashUntil = Time.time + DashDuration;
+                dashDir = transform.forward;
+            }
         }
 
-        // Camera sinks while dead
-        var targetCamY = isDead ? 0.4f : 1.65f;
+        // Crouch / slide (Ctrl)
+        crouching = playing && (kb.leftCtrlKey.isPressed || kb.rightCtrlKey.isPressed);
+        cc.height = Mathf.Lerp(cc.height, crouching ? 1.1f : 1.8f, 10f * Time.deltaTime);
+        cc.center = new Vector3(0, cc.height * 0.5f, 0);
+
+        // Camera height: sink while dead, lower while crouched
+        float targetCamY = isDead ? 0.4f : (crouching ? 1.05f : 1.65f);
         var camPos = cameraTransform.localPosition;
-        camPos.y = Mathf.Lerp(camPos.y, targetCamY, 6f * Time.deltaTime);
+        camPos.y = Mathf.Lerp(camPos.y, targetCamY, 8f * Time.deltaTime);
         cameraTransform.localPosition = camPos;
 
         // Move
@@ -140,59 +165,76 @@ public class FirstPersonController : MonoBehaviour
             mv = Vector2.ClampMagnitude(mv, 1f);
         }
 
-        var move = (transform.forward * mv.y + transform.right * mv.x) * moveSpeed;
+        float speed = crouching ? crouchSpeed : moveSpeed;
+        var move = (transform.forward * mv.y + transform.right * mv.x) * speed;
 
-        // Gravity + jump
+        // Dash impulse from the movement ability
+        if (Time.time < dashUntil) move += dashDir * DashSpeed;
+
         if (cc.isGrounded)
         {
             velocityY = -2f;
-            if (playing && kb.spaceKey.wasPressedThisFrame)
-                velocityY = Mathf.Sqrt(jumpHeight * -2f * gravity);
+            if (playing && kb.spaceKey.wasPressedThisFrame) velocityY = Mathf.Sqrt(jumpHeight * -2f * gravity);
         }
         velocityY += gravity * Time.deltaTime;
         move.y = velocityY;
-
         cc.Move(move * Time.deltaTime);
 
-        // Report position to the server
+        // Report position + crouch
         sendTimer += Time.deltaTime;
         keepaliveTimer += Time.deltaTime;
         if (sendTimer >= SendInterval)
         {
             sendTimer = 0f;
             bool moved = (transform.position - lastSentPos).sqrMagnitude > MinMoveDelta * MinMoveDelta;
-            if (moved || keepaliveTimer >= KeepaliveInterval)
+            if (moved || crouching != lastSentCrouch || keepaliveTimer >= KeepaliveInterval)
             {
                 keepaliveTimer = 0f;
                 lastSentPos = transform.position;
-                GameNetwork.Instance?.SendMove(transform.position, transform.eulerAngles.y);
+                lastSentCrouch = crouching;
+                net?.SendMove(transform.position, transform.eulerAngles.y, crouching);
             }
         }
     }
 
-    /// <summary>
-    /// Raycast from the crosshair; if it hits a remote player, report the
-    /// shot to the server (which validates range/rate and applies damage).
-    /// </summary>
-    void Shoot()
+    void FireWeapon(bool secondary)
     {
-        var cam = cameraTransform;
-        var origin = cam.position;
-        var dir = cam.forward;
+        var net = GameNetwork.Instance;
+        if (net == null || !net.alive) return;
 
+        var origin = cameraTransform.position;
+        var dir = cameraTransform.forward;
         Vector3 hitPoint = origin + dir * shootRange;
+        string targetId = null;
+
         if (Physics.Raycast(origin, dir, out var hit, shootRange))
         {
             hitPoint = hit.point;
             var tag = hit.collider.GetComponentInParent<RemotePlayerTag>();
-            if (tag != null)
-                GameNetwork.Instance?.SendShoot(tag.playerId);
+            if (tag != null) targetId = tag.playerId;
         }
 
-        FireTracer(origin + dir * 0.5f + cam.right * 0.1f - Vector3.up * 0.15f, hitPoint);
+        if (secondary) net.SecondaryFire(targetId);
+        else net.PrimaryFire(targetId);
+
+        FireTracer(origin + dir * 0.5f + cameraTransform.right * 0.1f - Vector3.up * 0.15f, hitPoint,
+            secondary ? new Color(1f, 0.5f, 0.2f) : new Color(1f, 0.9f, 0.2f));
     }
 
-    void FireTracer(Vector3 from, Vector3 to)
+    void MeleeAttack()
+    {
+        var net = GameNetwork.Instance;
+        if (net == null) return;
+        string targetId = null;
+        if (Physics.Raycast(cameraTransform.position, cameraTransform.forward, out var hit, 3.5f))
+        {
+            var tag = hit.collider.GetComponentInParent<RemotePlayerTag>();
+            if (tag != null) targetId = tag.playerId;
+        }
+        net.Melee(targetId);
+    }
+
+    void FireTracer(Vector3 from, Vector3 to, Color color)
     {
         var go = new GameObject("Tracer");
         var lr = go.AddComponent<LineRenderer>();
@@ -204,17 +246,15 @@ public class FirstPersonController : MonoBehaviour
         var shader = Shader.Find("Universal Render Pipeline/Unlit");
         if (shader == null) shader = Shader.Find("Unlit/Color");
         lr.material = new Material(shader);
-        lr.startColor = lr.endColor = new Color(1f, 0.9f, 0.2f);
+        lr.startColor = lr.endColor = color;
         Destroy(go, 0.08f);
     }
 
-    /// <summary>Teleport to the server-assigned respawn point.</summary>
     void RespawnAt(Vector3 pos)
     {
         cc.enabled = false;
         transform.position = pos;
-        pitch = 0;
-        velocityY = 0;
+        pitch = 0; velocityY = 0;
         cc.enabled = true;
         isDead = false;
     }

@@ -12,24 +12,26 @@ public class RemotePlayerTag : MonoBehaviour
 }
 
 /// <summary>
-/// RemotePlayerManager - renders other players from server WORLD_STATE
-/// snapshots. The server is the source of truth: avatars are spawned,
-/// moved (interpolated), damaged (health bars), killed (hidden), and
-/// respawned purely from snapshot data.
+/// RemotePlayerManager - renders other players + bots from the arena's
+/// server WORLD_STATE snapshots. Avatars are hero-tinted, interpolated,
+/// show health bars + name tags, and reflect status effects (frost/poison/
+/// stun/shield/stealth) purely from snapshot data.
 /// </summary>
 public class RemotePlayerManager : MonoBehaviour
 {
     class RemoteAvatar
     {
         public GameObject go;
+        public Renderer bodyRenderer;
         public TextMeshPro nameTag;
         public GameObject barRoot;
         public Transform barFill;
         public Vector3 targetPos;
         public float targetYaw;
         public string displayName;
-        public string team;
-        public int hp = 100;
+        public string hero;
+        public Color baseColor = Color.gray;
+        public int hp = 100, maxHp = 100;
         public bool alive = true;
     }
 
@@ -41,22 +43,21 @@ public class RemotePlayerManager : MonoBehaviour
     const float BarWidth = 1.0f;
     const float BarHeight = 0.12f;
 
-    static readonly Dictionary<string, Color> TeamColors = new Dictionary<string, Color>
-    {
-        { "red",   new Color(0.86f, 0.08f, 0.24f) },
-        { "blue",  new Color(0.12f, 0.56f, 1.00f) },
-        { "green", new Color(0.18f, 0.55f, 0.34f) },
-    };
-
     void Start()
     {
         GameNetwork.Instance.OnWorldState += OnWorldState;
+        GameNetwork.Instance.OnMatchEnd += _ => ClearAll();
     }
 
     void OnDestroy()
     {
-        if (GameNetwork.Instance != null)
-            GameNetwork.Instance.OnWorldState -= OnWorldState;
+        if (GameNetwork.Instance != null) GameNetwork.Instance.OnWorldState -= OnWorldState;
+    }
+
+    void ClearAll()
+    {
+        foreach (var av in remotes.Values) if (av.go != null) Destroy(av.go);
+        remotes.Clear();
     }
 
     void OnWorldState(JArray players)
@@ -71,44 +72,35 @@ public class RemotePlayerManager : MonoBehaviour
             if (string.IsNullOrEmpty(id) || id == net.playerId) continue; // skip self
             seen.Add(id);
 
-            var pos = new Vector3(
-                p["x"]?.ToObject<float>() ?? 0,
-                p["y"]?.ToObject<float>() ?? 0,
-                p["z"]?.ToObject<float>() ?? 0);
+            var pos = new Vector3(p["x"]?.ToObject<float>() ?? 0, p["y"]?.ToObject<float>() ?? 0, p["z"]?.ToObject<float>() ?? 0);
             var yaw = p["yaw"]?.ToObject<float>() ?? 0;
             var hp = p["hp"]?.ToObject<int>() ?? 100;
+            var maxHp = p["maxHp"]?.ToObject<int>() ?? 100;
             var alive = p["alive"]?.ToObject<bool>() ?? true;
+            var hero = p["hero"]?.ToString() ?? "";
+            var fx = p["fx"];
 
             if (!remotes.TryGetValue(id, out var av))
             {
-                av = SpawnAvatar(id, p["displayName"]?.ToString() ?? id,
-                                 p["team"]?.ToString() ?? "", pos);
+                av = SpawnAvatar(id, p["displayName"]?.ToString() ?? id, hero, pos);
                 remotes[id] = av;
             }
 
-            // Respawn = snap to the new position instead of interpolating
-            if (!av.alive && alive)
-                av.go.transform.position = pos + Vector3.up * 0.9f;
+            if (!av.alive && alive) av.go.transform.position = pos + Vector3.up * 0.9f; // snap on respawn
 
             av.targetPos = pos;
             av.targetYaw = yaw;
-            av.hp = hp;
+            av.hp = hp; av.maxHp = maxHp;
             av.alive = alive;
-            av.displayName = p["displayName"]?.ToString() ?? av.displayName;
 
             UpdateHealthBar(av);
+            ApplyStatus(av, fx);
             av.go.SetActive(alive);
         }
 
-        // Remove players that left the world
         var gone = new List<string>();
-        foreach (var kv in remotes)
-            if (!seen.Contains(kv.Key)) gone.Add(kv.Key);
-        foreach (var id in gone)
-        {
-            Destroy(remotes[id].go);
-            remotes.Remove(id);
-        }
+        foreach (var kv in remotes) if (!seen.Contains(kv.Key)) gone.Add(kv.Key);
+        foreach (var id in gone) { Destroy(remotes[id].go); remotes.Remove(id); }
     }
 
     void Update()
@@ -125,40 +117,39 @@ public class RemotePlayerManager : MonoBehaviour
 
     void LateUpdate()
     {
-        // Billboard name tags + health bars toward the active camera
         var cam = Camera.main;
         if (cam == null) return;
         foreach (var av in remotes.Values)
         {
             if (!av.alive) continue;
             var rot = Quaternion.LookRotation(av.go.transform.position - cam.transform.position);
-            if (av.nameTag != null) av.nameTag.transform.rotation = rot;
-            if (av.barRoot != null) av.barRoot.transform.rotation = rot;
+            if (av.nameTag != null && av.nameTag.gameObject.activeSelf) av.nameTag.transform.rotation = rot;
+            if (av.barRoot != null && av.barRoot.activeSelf) av.barRoot.transform.rotation = rot;
         }
     }
 
-    RemoteAvatar SpawnAvatar(string id, string displayName, string team, Vector3 pos)
+    RemoteAvatar SpawnAvatar(string id, string displayName, string hero, Vector3 pos)
     {
         var body = GameObject.CreatePrimitive(PrimitiveType.Capsule);
         body.name = "Remote_" + displayName;
         body.transform.SetParent(transform, false);
-        body.transform.position = pos + Vector3.up * 0.9f; // capsule center
-        Paint(body, TeamColors.TryGetValue(team, out var c) ? c : Color.gray);
+        body.transform.position = pos + Vector3.up * 0.9f;
+        var color = HeroCatalog.ColorFor(hero);
+        Paint(body, color);
         body.AddComponent<RemotePlayerTag>().playerId = id;
 
-        // Name tag (3D TMP text above head)
         var tagGo = new GameObject("NameTag");
         tagGo.transform.SetParent(body.transform, false);
         tagGo.transform.localPosition = new Vector3(0, 1.45f, 0);
         var tag = tagGo.AddComponent<TextMeshPro>();
-        tag.text = displayName;
+        var heroInfo = HeroCatalog.Get(hero);
+        tag.text = heroInfo != null ? $"{displayName}\n<size=2.5>{heroInfo.name}</size>" : displayName;
         tag.fontSize = 4;
         tag.alignment = TextAlignmentOptions.Center;
         tag.color = Color.white;
-        if (GameUI.GetFont() != null) tag.font = GameUI.GetFont();
+        if (UiKit.GetFont() != null) tag.font = UiKit.GetFont();
         tagGo.transform.localScale = Vector3.one * 0.4f;
 
-        // Health bar (two quads, billboarded)
         var barRoot = new GameObject("HealthBar");
         barRoot.transform.SetParent(body.transform, false);
         barRoot.transform.localPosition = new Vector3(0, 1.15f, 0);
@@ -167,7 +158,6 @@ public class RemotePlayerManager : MonoBehaviour
         bg.name = "BarBg";
         Destroy(bg.GetComponent<Collider>());
         bg.transform.SetParent(barRoot.transform, false);
-        bg.transform.localPosition = Vector3.zero;
         bg.transform.localScale = new Vector3(BarWidth, BarHeight, 1f);
         Paint(bg, new Color(0.1f, 0.1f, 0.1f, 1f), unlit: true);
 
@@ -175,34 +165,58 @@ public class RemotePlayerManager : MonoBehaviour
         fill.name = "BarFill";
         Destroy(fill.GetComponent<Collider>());
         fill.transform.SetParent(barRoot.transform, false);
-        fill.transform.localPosition = new Vector3(0, 0, -0.01f); // toward camera
+        fill.transform.localPosition = new Vector3(0, 0, -0.01f);
         fill.transform.localScale = new Vector3(BarWidth, BarHeight * 0.8f, 1f);
         Paint(fill, Color.green, unlit: true);
 
         return new RemoteAvatar
         {
-            go = body,
-            nameTag = tag,
-            barRoot = barRoot,
-            barFill = fill.transform,
-            targetPos = pos,
-            targetYaw = 0,
-            displayName = displayName,
-            team = team,
-            hp = 100,
-            alive = true
+            go = body, bodyRenderer = body.GetComponent<Renderer>(), nameTag = tag,
+            barRoot = barRoot, barFill = fill.transform,
+            targetPos = pos, targetYaw = 0, displayName = displayName, hero = hero,
+            baseColor = color, hp = 100, maxHp = 100, alive = true
         };
     }
 
     void UpdateHealthBar(RemoteAvatar av)
     {
         if (av.barFill == null) return;
-        float frac = Mathf.Clamp01(av.hp / 100f);
+        float frac = Mathf.Clamp01(av.hp / (float)Mathf.Max(1, av.maxHp));
         av.barFill.localScale = new Vector3(BarWidth * frac, BarHeight * 0.8f, 1f);
         av.barFill.localPosition = new Vector3(-BarWidth * (1f - frac) * 0.5f, 0, -0.01f);
         var r = av.barFill.GetComponent<Renderer>();
-        if (r != null)
-            r.material.color = Color.Lerp(Color.red, Color.green, frac);
+        if (r != null) r.material.color = Color.Lerp(Color.red, Color.green, frac);
+    }
+
+    /// <summary>Reflect compact status flags (fx) in the avatar's look.</summary>
+    void ApplyStatus(RemoteAvatar av, JToken fx)
+    {
+        if (av.bodyRenderer == null) return;
+        bool invis = fx?["invis"]?.ToObject<bool>() ?? false;
+        bool poison = fx?["poison"]?.ToObject<bool>() ?? false;
+        bool slow = fx?["slow"]?.ToObject<bool>() ?? false;
+        bool stun = fx?["stun"]?.ToObject<bool>() ?? false;
+        bool shield = fx?["shield"]?.ToObject<bool>() ?? false;
+
+        var col = av.baseColor;
+        if (poison) col = Color.Lerp(col, new Color(0.3f, 0.9f, 0.2f), 0.5f);
+        if (slow) col = Color.Lerp(col, new Color(0.5f, 0.8f, 1f), 0.4f);
+        if (stun) col = Color.Lerp(col, Color.yellow, 0.4f);
+
+        if (invis)
+        {
+            // Stealthed: dim heavily + hide tag/bar (still shootable - collider stays)
+            col = new Color(col.r * 0.25f, col.g * 0.25f, col.b * 0.25f, 1f);
+            if (av.nameTag != null) av.nameTag.gameObject.SetActive(false);
+            if (av.barRoot != null) av.barRoot.SetActive(false);
+        }
+        else
+        {
+            if (av.nameTag != null) av.nameTag.gameObject.SetActive(true);
+            if (av.barRoot != null) av.barRoot.SetActive(true);
+            if (av.nameTag != null) av.nameTag.color = shield ? new Color(0.6f, 0.9f, 1f) : Color.white;
+        }
+        av.bodyRenderer.material.color = col;
     }
 
     static void Paint(GameObject go, Color color, bool unlit = false)
